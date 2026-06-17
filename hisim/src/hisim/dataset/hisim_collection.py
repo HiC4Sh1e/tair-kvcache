@@ -56,6 +56,9 @@ class HisimCollectionDataset(BaseDataset):
                     custom_params={
                         "created_time": req[time_field_name] - min_created_ts,
                     },
+                    session_id=req.get("session_id"),
+                    parent_session_id=req.get("parent_session_id"),
+                    cache_control=req.get("cache_control"),
                 )
             )
 

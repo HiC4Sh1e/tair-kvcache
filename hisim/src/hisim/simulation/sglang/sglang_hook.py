@@ -548,6 +548,29 @@ class C_HiRadixCacheHook(BaseHook):
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
 
+        # --- Session-aware eviction for HiRadixCache ---
+        original_collect_leaves_device = target._collect_leaves_device
+
+        def wrapped_collect_leaves_device(self):
+            leaves = original_collect_leaves_device(self)
+            if not SESSION_TTL_TABLE:
+                return leaves
+            protected = []
+            filtered = []
+            for node in leaves:
+                if _is_node_session_protected(node):
+                    protected.append(node)
+                else:
+                    filtered.append(node)
+            if protected:
+                logger.debug(
+                    f"Session eviction protection: skipped {len(protected)} "
+                    f"device nodes ({sum(len(n.value) for n in protected)} tokens)"
+                )
+            return filtered
+
+        target._collect_leaves_device = wrapped_collect_leaves_device
+
 
 class C_StorageBackendFactory(BaseHook):
     HOOK_CLASS_NAME = "StorageBackendFactory"
@@ -560,6 +583,99 @@ class C_StorageBackendFactory(BaseHook):
             return MockHiCacheStorage()
 
         target.create_backend = override_create_backend
+
+
+# ====== Session TTL Manager ======
+# key = session_id, value = TTL deadline in virtual clock seconds
+SESSION_TTL_TABLE: dict[str, float] = {}
+
+
+def _update_session_ttl(session_id: str, cache_control: dict):
+    """Update or refresh session TTL. Last TTL wins."""
+    if session_id is None or cache_control is None:
+        return
+    if cache_control.get("type") != "ephemeral":
+        return
+    ttl_minutes = cache_control.get("ttl", 5)
+    ttl_minutes = max(0, min(ttl_minutes, 60))  # clamp to [0, 60]
+    ttl_deadline = StateManager.get_global_clock() + ttl_minutes * 60
+    SESSION_TTL_TABLE[session_id] = ttl_deadline
+    logger.debug(
+        f"Session TTL updated: session_id={session_id}, "
+        f"ttl={ttl_minutes}min, deadline={ttl_deadline:.2f}s"
+    )
+
+
+def _is_session_protected(session_id: str) -> bool:
+    """Check if session is TTL-protected (not expired)."""
+    if session_id is None or session_id not in SESSION_TTL_TABLE:
+        return False
+    if StateManager.get_global_clock() < SESSION_TTL_TABLE[session_id]:
+        return True
+    # TTL expired, clean up
+    del SESSION_TTL_TABLE[session_id]
+    return False
+
+
+def _cleanup_expired_sessions():
+    """Batch cleanup of all expired session TTL entries."""
+    now = StateManager.get_global_clock()
+    expired = [sid for sid, deadline in SESSION_TTL_TABLE.items() if now >= deadline]
+    for sid in expired:
+        del SESSION_TTL_TABLE[sid]
+    if expired:
+        logger.debug(f"Cleaned up {len(expired)} expired sessions.")
+
+
+def _is_node_session_protected(node) -> bool:
+    """Check if a TreeNode belongs to a session-protected subtree.
+
+    Walks up the tree from the given node to find the nearest node with
+    an extra_key (session namespace boundary). If that session is TTL-protected
+    and not expired, the node cannot be evicted.
+
+    Args:
+        node: A TreeNode from the radix cache.
+
+    Returns:
+        True if the node should be protected from eviction.
+    """
+    cur = node
+    while cur is not None:
+        if cur.key is not None and cur.key.extra_key is not None:
+            return _is_session_protected(cur.key.extra_key)
+        cur = cur.parent
+    return False
+
+
+class C_RadixCacheHook(BaseHook):
+    HOOK_CLASS_NAME = "RadixCache"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.radix_cache"
+
+    @classmethod
+    def hook(cls, target):
+        original_collect_leaves = target._collect_leaves
+
+        def wrapped_collect_leaves(self):
+            leaves = original_collect_leaves(self)
+            if not SESSION_TTL_TABLE:
+                return leaves
+            # Filter out nodes belonging to session-protected subtrees
+            protected = []
+            filtered = []
+            for node in leaves:
+                if _is_node_session_protected(node):
+                    protected.append(node)
+                else:
+                    filtered.append(node)
+            if protected:
+                logger.debug(
+                    f"Session eviction protection: skipped {len(protected)} "
+                    f"nodes ({sum(len(n.value) for n in protected)} tokens)"
+                )
+            return filtered
+
+        target._collect_leaves = wrapped_collect_leaves
 
 
 class C_SchedulerHook(BaseHook):
@@ -749,6 +865,21 @@ class C_SchedulerHook(BaseHook):
                             StateManager.set_global_clock(queue_start)
                         req_stats.queue_start = StateManager.get_global_clock()
 
+                    # --- Session info passthrough ---
+                    session_id = simulation_args.get("session_id")
+                    req_stats.session_id = session_id
+                    req_stats.parent_session_id = simulation_args.get(
+                        "parent_session_id"
+                    )
+                    # Store session_id as __extra_key__ for later injection into Req
+                    if session_id is not None:
+                        simulation_args["__extra_key__"] = session_id
+                        # Update session TTL on request arrival
+                        cache_control = simulation_args.get("cache_control")
+                        if cache_control is not None:
+                            _update_session_ttl(session_id, cache_control)
+                    # --- End session passthrough ---
+
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
                 StateManager.set_global_clock(0)
@@ -756,12 +887,47 @@ class C_SchedulerHook(BaseHook):
             return recv_reqs
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+            # --- Pre-inject session extra_key BEFORE original call ---
+            # The original get_new_batch_prefill calls init_next_round_input()
+            # which does match_prefix(RadixKey(..., extra_key=self.extra_key)).
+            # We must set req.extra_key BEFORE this call so the prefix
+            # cache lookup happens in the correct session namespace.
+            # Requests are in self.waiting_queue at this point.
+            for req in self.waiting_queue:
+                sim_args = (
+                    req.sampling_params.custom_params.get("simulation", {})
+                    if hasattr(req, "sampling_params")
+                    and isinstance(req.sampling_params, object)
+                    and hasattr(req.sampling_params, "custom_params")
+                    and isinstance(req.sampling_params.custom_params, dict)
+                    else {}
+                )
+                extra_key_from_session = sim_args.get("__extra_key__")
+                if extra_key_from_session and hasattr(req, "extra_key"):
+                    req.extra_key = extra_key_from_session
+            # --- End pre-injection ---
+
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
             now = time.time()
             if new_batch is not None:
                 for req in new_batch.reqs:
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                     req_stats.final_reused_tokens = req.cached_tokens
+
+                    # --- Session extra_key post-processing ---
+                    # Refresh session TTL on cache hit (request was scheduled)
+                    sim_args = (
+                        req.sampling_params.custom_params.get("simulation", {})
+                        if isinstance(req.sampling_params.custom_params, dict)
+                        else {}
+                    )
+                    extra_key_from_session = sim_args.get("__extra_key__")
+                    if extra_key_from_session:
+                        cache_control = sim_args.get("cache_control")
+                        if cache_control is not None:
+                            _update_session_ttl(extra_key_from_session, cache_control)
+                    # --- End session post-processing ---
+
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                             req_stats.queue_end = now
@@ -897,6 +1063,8 @@ class C_SchedulerHook(BaseHook):
                     }
                 )
             C_SchedulerHook.LAST_CPU_TS = time.time()
+            # Cleanup expired session TTL entries each iteration
+            _cleanup_expired_sessions()
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
@@ -948,6 +1116,7 @@ class C_SchedulerHook(BaseHook):
                 logger.warning("No request statistics available.")
 
             StateManager.reset()
+            SESSION_TTL_TABLE.clear()
             C_SchedulerHook.REQUEST_STATS.clear()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.LAST_CPU_TS = 0

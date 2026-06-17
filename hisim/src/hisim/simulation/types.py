@@ -59,6 +59,8 @@ class RequestStats:
     queue_end: float = -1
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
+    session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
 
     def is_complete(self) -> bool:
         return True

@@ -12,6 +12,9 @@ class GenericRequest:
     input_length: int = -1
     output_length: int = -1
     custom_params: dict = field(default_factory=dict)
+    session_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    cache_control: Optional[dict] = None  # {"type": "ephemeral", "ttl": 5}
 
     def __post_init__(self):
         if self.prompt is None and self.token_ids is None:

@@ -62,6 +62,11 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     total_reused_tokens = 0
     total_disk_hit_tokens = 0
     queue_durs = []
+    # Session-aware metrics
+    session_ids = set()
+    session_request_count = 0
+    session_input = 0
+    session_reused_tokens = 0
     for req in requests:
         if not req.is_complete():
             continue
@@ -78,6 +83,12 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         total_output += req.output_length
         total_reused_tokens += req.final_reused_tokens
         total_disk_hit_tokens += req.prefetch_complete_tokens
+        # Session metrics
+        if req.session_id is not None:
+            session_ids.add(req.session_id)
+            session_request_count += 1
+            session_input += req.input_length
+            session_reused_tokens += req.final_reused_tokens
     return {
         "num_requests": len(requests),
         "completed": completed,
@@ -121,4 +132,10 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "p95_e2e_latency_ms": np.percentile(e2e_latencies or 0, 95) * 1000,
         "p99_e2e_latency_ms": np.percentile(e2e_latencies or 0, 99) * 1000,
         "time_cost": -1,  # Updated by external benchmark caller
+        # Session-aware metrics
+        "num_sessions": len(session_ids),
+        "session_request_count": session_request_count,
+        "session_cache_reused_ratio": 0
+        if session_input == 0
+        else session_reused_tokens / session_input,
     }

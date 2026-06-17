@@ -32,6 +32,7 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_StorageBackendFactory,
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
+        sglang_hook.C_RadixCacheHook,
     ]
 )
 
@@ -96,6 +97,9 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
             simulation_params = {
                 "total_request": len(dataset),  # include the warmup requests.
                 "created_time": created_time,
+                "session_id": req.session_id,
+                "parent_session_id": req.parent_session_id,
+                "cache_control": req.cache_control,
             }
             if with_queue_start:
                 simulation_params["queue_start"] = req.custom_params.get("queue_start")
