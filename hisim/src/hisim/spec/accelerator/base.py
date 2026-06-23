@@ -24,14 +24,14 @@ class AcceleratorInfo:
     ref: str = ""
 
     @classmethod
-    def from_dict(cls, config: Dict, save_to_registry: bool = False):
+    def from_dict(cls, config: Dict, save_to_registry: bool = False, force_registry: bool = False):
         acc = cls(**config)
         if save_to_registry:
-            if acc.name in _acc_alias:
+            if acc.name in _acc_alias and not force_registry:
                 logger.error(f"{acc.name} is already in registry")
             _all_accs_[acc.device_name.upper()] = acc
             for alias in acc.device_alias:
-                if alias in _acc_alias:
+                if alias in _acc_alias and not force_registry:
                     logger.warning(f"Device alias [{alias}] is already in registry.")
                 else:
                     _acc_alias[alias] = acc.device_name.upper()

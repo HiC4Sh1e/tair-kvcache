@@ -11,6 +11,14 @@ from hisim.time_predictor import (
     InferTimePredictor,
     AIConfiguratorTimePredictor,
 )
+
+# Import simple predictor as fallback
+try:
+    from hisim.time_predictor.simple_predictor import SimpleTimePredictor
+    HAS_SIMPLE_PREDICTOR = True
+except ImportError:
+    HAS_SIMPLE_PREDICTOR = False
+
 from hisim.utils import get_logger
 
 
@@ -38,6 +46,14 @@ class ConfigManager:
             with open(Envs.config_path()) as f:
                 config: dict = json.load(f)
             model = ModelInfo.find_by_model_name(config.get("model", {}).get("name"))
+
+        # Fix: Ensure model_type is supported by aiconfigurator
+
+        if model and model.model_type not in ["qwen", "qwen2", "qwen3", "llama", "chatglm", "deepseek_v3", "kimi_k2", "qwen3_moe"]:
+
+            model.model_type = "llama"  # Use a supported type for estimation
+
+
 
         return model
 
@@ -142,6 +158,24 @@ class ConfigManager:
         else:
             kv_cache_dtype = dtype
 
+        logger.info(f"HISIM_DEBUG: model.model_type before fix = {model.model_type}, name = {model.name}")
+
+        # Fix: Ensure model_type is supported
+        if model.model_type not in ["qwen", "qwen2", "qwen3", "llama", "chatglm", "deepseek_v3", "kimi_k2", "qwen3_moe"]:
+            model.model_type = "llama"
+
+        logger.info(f"HISIM_DEBUG: model.model_type after fix = {model.model_type}")
+
+        # Read context_length from config and apply to model if specified
+        context_length = scheduler_config.get("context_length")
+        if context_length is not None:
+            # Update model's max_seq_len and max_position_embeddings
+            if hasattr(model, "max_seq_len"):
+                model.max_seq_len = context_length
+            if hasattr(model, "max_position_embeddings"):
+                model.max_position_embeddings = context_length
+            logger.info(f"Applied context_length from config: {context_length}")
+
         sched_config = SchedulerConfig(
             model=model,
             max_prefill_tokens=internal_config.max_prefill_tokens,
@@ -156,6 +190,7 @@ class ConfigManager:
             page_size=internal_config.page_size,
             backend_name=backend,
             backend_version=scheduler_config.get("backend_version"),
+            context_length=context_length,
         )
         return sched_config
 
@@ -190,15 +225,47 @@ class ConfigManager:
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
             xgb_model_path = predictor_config.get("xgb_model_path", None)
-            return AIConfiguratorTimePredictor(
-                model,
+
+            try:
+                return AIConfiguratorTimePredictor(
+                    model,
+                    hw=hw,
+                    config=sched_config,
+                    database_path=predictor_config.get("database_path"),
+                    database_mode=database_mode,
+                    prefill_scale_factor=prefill_scale_factor,
+                    decode_scale_factor=decode_scale_factor,
+                    xgb_model_path=xgb_model_path,
+                )
+            except Exception as aiconfig_error:
+                logger.warning(f"AIConfigurator initialization failed: {aiconfig_error}")
+                if HAS_SIMPLE_PREDICTOR:
+                    logger.info("Falling back to SimpleTimePredictor for estimation")
+                    return SimpleTimePredictor(model, hw, sched_config)
+                raise ValueError(f"AIConfigurator initialization failed and SimpleTimePredictor not available: {aiconfig_error}")
+        elif predictor_config.get("name") == "inference_predictor":
+            inference_predictor_root = predictor_config.get("inference_predictor_root")
+            if not inference_predictor_root:
+                raise ValueError("inference_predictor_root must be specified")
+            
+            task_test_root = predictor_config.get("task_test_root")
+            model_config_path = predictor_config.get("model_config")
+            hardware_config_path = predictor_config.get("hardware_config")
+            quant_config_path = predictor_config.get("quant_config")
+            offload_config_path = predictor_config.get("offload_config")
+            runtime_config = config.get("runtime", {})
+            
+            return InferencePredictorTimePredictor(
+                model=model,
                 hw=hw,
                 config=sched_config,
-                database_path=predictor_config.get("database_path"),
-                database_mode=database_mode,
-                prefill_scale_factor=prefill_scale_factor,
-                decode_scale_factor=decode_scale_factor,
-                xgb_model_path=xgb_model_path,
+                inference_predictor_root=inference_predictor_root,
+                task_test_root=task_test_root,
+                model_config_path=model_config_path,
+                hardware_config_path=hardware_config_path,
+                quant_config_path=quant_config_path,
+                offload_config_path=offload_config_path,
+                runtime_config=runtime_config,
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

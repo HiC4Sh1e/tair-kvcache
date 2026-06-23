@@ -178,6 +178,8 @@ class ModelInfo:
 
     @staticmethod
     def find_by_model_name(model_name: str) -> Union[None, "ModelInfo"]:
+        if model_name is None:
+            return None
         return _all_models_.get(model_name.upper(), None)
 
     @staticmethod
@@ -204,12 +206,13 @@ class ModelInfo:
 
     @classmethod
     def from_config(cls, config: Dict):
-        model_info = cls.find_by_model_name(config.get("name", ""))
+        model_name = config.get("name", "")
+        model_info = cls.find_by_model_name(model_name)
         if model_info is not None:
             # deepcopy -> prevent model information from being modified.
             return copy.deepcopy(model_info)
         config["name"] = (
-            f"{config.get('name', '')}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            f"{model_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         )
         return cls.from_dict(config)
 

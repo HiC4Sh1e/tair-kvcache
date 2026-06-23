@@ -1724,7 +1724,16 @@ def sample_hisim_collection_requests(
         )
 
     with open(dataset_path, "r") as f:
-        raw_input_requests = [json.loads(line) for line in f if line.strip()]
+        first_line = f.readline().strip()
+        f.seek(0)  # Reset file pointer
+
+        # Check if it's a JSON array format (starts with '[')
+        if first_line.startswith('['):
+            # JSON array format - load entire file as one JSON object
+            raw_input_requests = json.load(f)
+        else:
+            # JSONL format - each line is a JSON object
+            raw_input_requests = [json.loads(line) for line in f if line.strip()]
 
     if len(raw_input_requests) < num_requests:
         print(
@@ -1740,10 +1749,18 @@ def sample_hisim_collection_requests(
     )
     for idx in range(num_requests):
         item = raw_input_requests[idx]
+        # Calculate input_length if not present (for JSONL datasets with only input_ids)
+        if "input_length" in item:
+            input_length = item["input_length"]
+        else:
+            # Calculate from input_ids array
+            input_ids = item.get("input_ids", [])
+            input_length = len(input_ids) if isinstance(input_ids, list) else item.get("prompt_len", 0)
+
         input_requests.append(
             DatasetRow(
                 prompt=tokenizer.decode(item["input_ids"]),
-                prompt_len=item["input_length"],
+                prompt_len=input_length,
                 output_len=item["output_length"],
                 timestamp=item[timestamp_field_name],
             )
@@ -1997,17 +2014,21 @@ def load_simulation_metrics() -> BenchmarkMetrics | None:
     metrics_path = os.path.join(out_dir, "metrics.json")
     if not os.path.exists(metrics_path):
         print(f"Fail to get simmulation metrics from {out_dir}")
-        return
+        return None
 
-    with open(metrics_path) as f:
-        data = json.load(f)
+    try:
+        with open(metrics_path) as f:
+            data = json.load(f)
 
-    metrics_fields = {f.name for f in fields(BenchmarkMetrics)}
-    # -1 means invalid value.
-    kwargs = {k: data.get(k, -1) for k in metrics_fields}
+        metrics_fields = {f.name for f in fields(BenchmarkMetrics)}
+        # -1 means invalid value.
+        kwargs = {k: data.get(k, -1) for k in metrics_fields}
 
-    kwargs.update({"bench_mode": "simulation"})
-    return BenchmarkMetrics(**kwargs)
+        kwargs.update({"bench_mode": "simulation"})
+        return BenchmarkMetrics(**kwargs)
+    except Exception as e:
+        print(f"Failed to load simulation metrics from {metrics_path}: {e}")
+        return None
 
 
 async def benchmark(
@@ -2283,7 +2304,11 @@ async def benchmark(
     )
     if args.bench_mode == "simulation":
         # Get the real metrics from the server, because the server metrics are not reliable during simulation.
-        metrics = load_simulation_metrics()
+        sim_metrics = load_simulation_metrics()
+        if sim_metrics is not None:
+            metrics = sim_metrics
+        else:
+            print("Warning: Failed to load simulation metrics, using calculated metrics for display")
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Benchmark Mode:", metrics.bench_mode))

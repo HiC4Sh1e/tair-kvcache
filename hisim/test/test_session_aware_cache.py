@@ -16,8 +16,14 @@ from pathlib import Path
 
 os.environ["HISIM_CONFIG_PATH"] = os.path.dirname(__file__) + "/assets/mock/config.json"
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
 
 from env import check_framework, MODEL_PATH
+
+# Use local model to avoid network download issues
+if not os.path.exists(MODEL_PATH) or not os.path.exists(os.path.join(MODEL_PATH, "config.json")):
+    MODEL_PATH = "/home/models/Qwen3-8B"
+    print(f"Using local model: {MODEL_PATH}")
 from hisim.dataset import DatasetArgs
 from hisim.simulation.types import BenchmarkConfig
 
@@ -25,10 +31,11 @@ from hisim.simulation.types import BenchmarkConfig
 @pytest.mark.skipif(
     not check_framework("sglang", device="cpu"), reason="sglang is not installed."
 )
-@pytest.mark.skipif(
-    not check_framework("vllm"),
-    reason="The cpu simulation might require vLLM's kernels.",
-)
+# Temporarily skip vllm check for CPU simulation (issue: vllm not installed)
+# @pytest.mark.skipif(
+#     not check_framework("vllm"),
+#     reason="The cpu simulation might require vLLM's kernels.",
+# )
 def test_session_isolation():
     """Scenario 1: Session Isolation.
 
@@ -111,10 +118,11 @@ def test_session_isolation():
 @pytest.mark.skipif(
     not check_framework("sglang", device="cpu"), reason="sglang is not installed."
 )
-@pytest.mark.skipif(
-    not check_framework("vllm"),
-    reason="The cpu simulation might require vLLM's kernels.",
-)
+# Temporarily skip vllm check for CPU simulation
+# @pytest.mark.skipif(
+#     not check_framework("vllm"),
+#     reason="The cpu simulation might require vLLM's kernels.",
+# )
 def test_session_ttl_refresh():
     """Scenario 3: TTL Refresh (Last TTL Wins).
 
@@ -170,10 +178,11 @@ def test_session_ttl_refresh():
 @pytest.mark.skipif(
     not check_framework("sglang", device="cpu"), reason="sglang is not installed."
 )
-@pytest.mark.skipif(
-    not check_framework("vllm"),
-    reason="The cpu simulation might require vLLM's kernels.",
-)
+# Temporarily skip vllm check for CPU simulation
+# @pytest.mark.skipif(
+#     not check_framework("vllm"),
+#     reason="The cpu simulation might require vLLM's kernels.",
+# )
 def test_session_metrics_in_output():
     """Verify that session metrics appear in the metrics output.
 

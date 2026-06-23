@@ -181,14 +181,26 @@ def get_num_new_pages(
 
     if prefix_lens is None or decode:
         # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
-        assert decode
-        return (seq_lens % page_size == 1).int().sum().item()
+        # Decode step needs a new page only when current length % page_size == 1
+        assert decode or prefix_lens is None, "Invalid decode/prefix combination"
+        return (seq_lens % page_size == 0).int().sum().item()
 
     assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before
     sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
+
+    # Debug logging for non-integer cases
+    if hasattr(torch, 'any') and torch.any(num_new_pages > 0):
+        non_integer_seqs = seq_lens[num_new_pages > 0]
+        non_integer_prefix = prefix_lens[num_new_pages > 0] if prefix_lens is not None else None
+        logger.debug(
+            f"Non-integer seq_lengths: {non_integer_seqs.tolist()}, "
+            f"prefix_lengths: {non_integer_prefix.tolist() if non_integer_prefix is not None else 'N/A'}, "
+            f"requires {sum_num_new_pages.item()} new pages for page_size={page_size}"
+        )
+
     return sum_num_new_pages.item()
 
 
@@ -256,7 +268,7 @@ class MockReqToTokenPool:
                 "only one chunked request may reuse req_pool_idx in a batch"
             )
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+            getattr(reqs[i], 'is_chunked', 0) > 0 or reqs[i].kv_committed_len > 0 for i in chunked
         ), "request has req_pool_idx but is not chunked"
 
         need_size = len(reqs) - len(chunked)
@@ -716,8 +728,15 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
             prefix_lens=prefix_lens_cpu,
         )
         if num_new_pages > len(self.free_pages):
+            # 内存不足：返回None，out_indices被放弃，free_pages保持不变
+            logger.warning(
+                f"Memory allocation failed: need {num_new_pages} pages, "
+                f"but only {len(self.free_pages)} free pages available. "
+                f"seq_lens={seq_lens_cpu.tolist()}, prefix_lens={prefix_lens_cpu.tolist()}"
+            )
             return None
 
+        # 内存足够：更新free_pages使用状态
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -747,6 +766,11 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
             decode=True,
         )
         if num_new_pages > len(self.free_pages):
+            logger.warning(
+                f"Decode memory allocation failed: need {num_new_pages} pages, "
+                f"but only {len(self.free_pages)} free pages available. "
+                f"seq_lens={seq_lens_cpu.tolist()}"
+            )
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]

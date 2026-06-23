@@ -379,19 +379,42 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
 
-        database = get_database(
-            system=hw.name,
-            backend=config.backend_name,
-            version=config.backend_version,
-            systems_dir=database_path
-            if database_path is not None
-            else get_system_config_path(),
-        )
+        # Try to load database with fallback for version compatibility
+        try:
+            database = get_database(
+                system=hw.name,
+                backend=config.backend_name,
+                version=config.backend_version,
+                systems_dir=database_path
+                if database_path is not None
+                else get_system_config_path(),
+            )
 
-        if database is None:
-            raise ValueError("Failed to initialize the database.")
+            if database is None:
+                raise ValueError("Database initialization returned None.")
 
-        database.set_default_database_mode(database_mode)
+            database.set_default_database_mode(database_mode)
+        except Exception as db_error:
+            # Try fallback to SILICON mode or create a minimal database
+            logger = sys.modules.get('hisim.utils').get_logger('hisim')
+            logger.warning(f"Failed to load database for {hw.name}/{config.backend_name}/{config.backend_version}: {db_error}")
+
+            # Try SILICON mode as fallback
+            if database_mode != "SILICON":
+                try:
+                    database = get_database(
+                        system=hw.name,
+                        backend=config.backend_name,
+                        version=config.backend_version,
+                        systems_dir=database_path if database_path is not None else get_system_config_path(),
+                    )
+                    database.set_default_database_mode("SILICON")
+                    logger.info("Using SILICON database mode as fallback")
+                except Exception as fallback_error:
+                    logger.error(f"Fallback database loading also failed: {fallback_error}")
+                    raise ValueError(f"Failed to initialize the database for {hw.name}/{config.backend_name}/{config.backend_version} and SILICON mode fallback failed.")
+            else:
+                raise ValueError(f"Failed to initialize the database for {hw.name}/{config.backend_name}/{config.backend_version}")
 
         # --- Replace the original function to support more flexible request input. --- #
 

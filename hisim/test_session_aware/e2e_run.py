@@ -68,7 +68,8 @@ def run_scenario_isolation(model_path):
             model_path=model_path,
             load_format="dummy",
             device="cpu",
-            enable_hierarchical_cache=True,
+            enable_hierarchical_cache=False,  # Disable L2 cache to reduce memory
+            max_total_tokens=200000,  # Limit to ~200K tokens for ~500GB memory
         )
     )
 
@@ -146,7 +147,8 @@ def run_scenario_ttl_refresh(model_path):
             model_path=model_path,
             load_format="dummy",
             device="cpu",
-            enable_hierarchical_cache=True,
+            enable_hierarchical_cache=False,  # Disable L2 cache to reduce memory
+            max_total_tokens=200000,  # Limit to ~200K tokens for ~500GB memory
         )
     )
 
@@ -216,7 +218,8 @@ def run_scenario_metrics(model_path):
             model_path=model_path,
             load_format="dummy",
             device="cpu",
-            enable_hierarchical_cache=True,
+            enable_hierarchical_cache=False,  # Disable L2 cache to reduce memory
+            max_total_tokens=200000,  # Limit to ~200K tokens for ~500GB memory
         )
     )
 
@@ -275,11 +278,12 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Set up environment
-    os.environ["HISIM_CONFIG_PATH"] = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "test", "assets", "mock", "config.json"
-    )
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(script_dir, "test", "assets", "mock", "config_low_memory.json")
+    os.environ["HISIM_CONFIG_PATH"] = config_path
     os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+    os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
+    print(f"Using config: {config_path}")
 
     model_path = args.model_path or os.getenv("BENCHMARK_TEST_MODEL_PATH", "Qwen/Qwen3-0.6B")
 

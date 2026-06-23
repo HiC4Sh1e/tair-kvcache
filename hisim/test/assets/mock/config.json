@@ -11,12 +11,17 @@
     },
     "predictor": {
         "name": "aiconfigurator",
-        "device_name": "h100_sxm"
+        "device_name": "h100_sxm",
+        "database_mode": "ESTIMATED"
     },
     "scheduler": {
         "tp_size": 1,
         "ep_size": 1,
         "dp_size": 1,
-        "backend_version": "0.5.6.post2"
+        "backend_version": "0.5.6.post2",
+        "context_length": 200704
+    },
+    "model": {
+        "name": "Qwen3-32B"
     }
 }

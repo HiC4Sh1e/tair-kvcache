@@ -36,6 +36,7 @@ class SchedulerConfig:
     pp_size: int = 1
     max_running_requests: int = (1 << 31) - 1
     page_size: Optional[int] = None
+    context_length: Optional[int] = None
 
     # framework backend
     backend_name: str = "sglang"
