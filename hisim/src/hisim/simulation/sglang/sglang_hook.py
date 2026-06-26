@@ -119,6 +119,12 @@ class C_TokenizerManagerHook(BaseHook):
                                     StateManager.set_global_clock(queue_start)
                                 except:
                                     pass  # StateManager may not be initialized yet
+
+                        # Session-aware: extract session info for BLOCKING mode
+                        session_id = simulation_args.get("session_id")
+                        if session_id is not None:
+                            req_stats.session_id = session_id
+                            req_stats.parent_session_id = simulation_args.get("parent_session_id")
                     else:
                         # Fallback for simulation tracking
                         req_stats.created_time = now
@@ -155,6 +161,12 @@ class C_TokenizerManagerHook(BaseHook):
                         queue_start = simulation_args.get("queue_start")
                         if queue_start is not None:
                             req_stats.queue_start = queue_start
+
+                        # Session-aware: extract session info for BLOCKING mode (0.5.9)
+                        session_id = simulation_args.get("session_id")
+                        if session_id is not None:
+                            req_stats.session_id = session_id
+                            req_stats.parent_session_id = simulation_args.get("parent_session_id")
                     else:
                         # Fallback for basic tracking
                         req_stats.created_time = created_time
@@ -911,6 +923,92 @@ class C_StorageBackendFactory(BaseHook):
         target.create_backend = override_create_backend
 
 
+# ====== Session TTL Management ======
+# Tracks per-session TTL deadlines for session-aware eviction protection.
+# Key = session_id, Value = virtual clock deadline (seconds) when TTL expires.
+SESSION_TTL_TABLE: dict[str, float] = {}
+
+# Tracks which sessions "own" which radix tree nodes.
+# Used for eviction protection: if a node belongs to a TTL-protected session,
+# it should not be evicted.
+# Key = TreeNode.id, Value = set of session_ids that own this node.
+NODE_OWNERS: dict[int, set[str]] = {}
+
+
+def _update_session_ttl(session_id: str, cache_control: dict):
+    """Update/refresh session TTL. Last TTL wins (overwrites previous)."""
+    if session_id is None or cache_control is None:
+        return
+    if cache_control.get("type") != "ephemeral":
+        return
+    ttl_minutes = cache_control.get("ttl", 5)
+    ttl_minutes = max(0, min(ttl_minutes, 60))  # clamp to [0, 60]
+    ttl_deadline = StateManager.get_global_clock() + ttl_minutes * 60
+    SESSION_TTL_TABLE[session_id] = ttl_deadline
+    logger.debug(
+        f"Session TTL updated: session_id={session_id}, "
+        f"ttl={ttl_minutes}min, deadline={ttl_deadline:.2f}s"
+    )
+
+
+def _is_session_protected(session_id: str) -> bool:
+    """Check if a session is TTL-protected (not expired)."""
+    if session_id is None or session_id not in SESSION_TTL_TABLE:
+        return False
+    if StateManager.get_global_clock() < SESSION_TTL_TABLE[session_id]:
+        return True
+    # TTL expired, clean up entry
+    del SESSION_TTL_TABLE[session_id]
+    return False
+
+
+def _cleanup_expired_sessions():
+    """Remove all expired session TTL entries."""
+    now = StateManager.get_global_clock()
+    expired = [sid for sid, deadline in SESSION_TTL_TABLE.items() if now >= deadline]
+    for sid in expired:
+        del SESSION_TTL_TABLE[sid]
+    if expired:
+        logger.debug(f"Cleaned up {len(expired)} expired sessions.")
+
+
+def _tag_node_with_session(node, session_id: str):
+    """Associate a radix tree node with a session for eviction tracking."""
+    if node is None or session_id is None:
+        return
+    node_id = node.id
+    if node_id not in NODE_OWNERS:
+        NODE_OWNERS[node_id] = set()
+    NODE_OWNERS[node_id].add(session_id)
+
+
+def _is_node_protected(node) -> bool:
+    """Check if a node belongs to any TTL-protected session."""
+    if node is None:
+        return False
+    node_id = node.id
+    owner_sessions = NODE_OWNERS.get(node_id)
+    if owner_sessions is None:
+        return False
+    for sid in owner_sessions:
+        if _is_session_protected(sid):
+            return True
+    return False
+
+
+def _remove_node_ownership(node):
+    """Remove ownership tracking when a node is deleted."""
+    if node is None:
+        return
+    node_id = node.id
+    NODE_OWNERS.pop(node_id, None)
+
+
+def _clear_node_ownership():
+    """Clear all node ownership tracking."""
+    NODE_OWNERS.clear()
+
+
 class C_SchedulerHook(BaseHook):
     HOOK_CLASS_NAME = "Scheduler"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
@@ -1340,6 +1438,12 @@ class C_SchedulerHook(BaseHook):
                         req_stats.last_event_time = StateManager.get_global_clock()
                         req_stats.queue_start = StateManager.get_global_clock()
 
+                    # Session-aware: extract session info from simulation_args
+                    session_id = simulation_args.get("session_id")
+                    if session_id is not None:
+                        req_stats.session_id = session_id
+                        req_stats.parent_session_id = simulation_args.get("parent_session_id")
+
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
                 # Don't reset global clock to 0 - it may have been properly initialized
@@ -1367,6 +1471,14 @@ class C_SchedulerHook(BaseHook):
                             req_stats.queue_end = now
                         else:
                             req_stats.queue_end = StateManager.get_global_clock()
+
+                    # Session-aware: update session TTL when request is scheduled
+                    sim_args = req.sampling_params.custom_params.get("simulation", {})
+                    if sim_args.get("session_id") and sim_args.get("cache_control"):
+                        _update_session_ttl(
+                            sim_args["session_id"], sim_args["cache_control"]
+                        )
+
                     else:
                         # Chunked request - update state tracking
                         prefill_completed_len = getattr(req, 'prefill_completed_len', 0)
@@ -1811,6 +1923,10 @@ class C_SchedulerHook(BaseHook):
                         logger.debug(f"Failed to update cache stats file: {e}")
 
             C_SchedulerHook.LAST_CPU_TS = time.time()
+
+            # Session-aware: cleanup expired session TTL entries
+            _cleanup_expired_sessions()
+
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
@@ -1881,6 +1997,8 @@ class C_SchedulerHook(BaseHook):
                     logger.warning(f"  - Request {rid}: rid={item.rid}, input_length={item.input_length}, created_time={item.created_time}")
 
             StateManager.reset()
+            SESSION_TTL_TABLE.clear()
+            _clear_node_ownership()
             C_SchedulerHook.REQUEST_STATS.clear()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.LAST_CPU_TS = 0
@@ -1961,6 +2079,12 @@ class C_SchedulerRequestReceiverHook(BaseHook):
                             StateManager.set_global_clock(queue_start)
                         req_stats.queue_start = StateManager.get_global_clock()
 
+                    # Session-aware: extract session info for SGLang 0.5.13+ path
+                    session_id = simulation_args.get("session_id")
+                    if session_id is not None:
+                        req_stats.session_id = session_id
+                        req_stats.parent_session_id = simulation_args.get("parent_session_id")
+
             if recv_reqs and getattr(C_SchedulerHook, 'LAST_CPU_TS', None) == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
                 StateManager.set_global_clock(0)
@@ -1972,13 +2096,15 @@ class C_SchedulerRequestReceiverHook(BaseHook):
 
 
 class C_RadixCacheFixHook(BaseHook):
-    """Hook to fix radix cache assertion errors during chunked operations"""
+    """Hook to fix radix cache assertion errors during chunked operations
+    and add session-aware TTL-protected eviction."""
     HOOK_CLASS_NAME = "RadixCache"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.radix_cache"
 
     @classmethod
     def hook(cls, target):
         original_cache_unfinished_req = target.cache_unfinished_req
+        original_evict = target.evict
 
         # Import necessary classes for the wrapper
         from sglang.srt.mem_cache.radix_cache import RadixKey, MatchPrefixParams, InsertParams
@@ -2040,6 +2166,15 @@ class C_RadixCacheFixHook(BaseHook):
 
                 req.cache_protected_len = len(new_indices)
 
+                # Session-aware: tag nodes along the prefix path with session_id
+                sim_args = req.sampling_params.custom_params.get("simulation", {}) if hasattr(req, 'sampling_params') and req.sampling_params else {}
+                session_id = sim_args.get("session_id")
+                if session_id is not None:
+                    tag_node = new_last_node
+                    while tag_node is not None and tag_node is not self.root_node:
+                        _tag_node_with_session(tag_node, session_id)
+                        tag_node = tag_node.parent
+
             except (AttributeError, ValueError, RuntimeError) as e:
                 # Handle errors gracefully in simulation mode
                 # This prevents simulation crashes due to simulation-specific issues
@@ -2052,6 +2187,82 @@ class C_RadixCacheFixHook(BaseHook):
         # Apply the wrapper only if original method exists
         if hasattr(target, 'cache_unfinished_req'):
             target.cache_unfinished_req = wrapped_cache_unfinished_req
+
+        # --- Session-aware: TTL-protected eviction ---
+        def wrapped_evict(self, params):
+            """Eviction with session TTL protection: skip nodes owned by protected sessions."""
+            if self.disable:
+                from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+                return EvictResult()
+
+            start_time = time.perf_counter()
+            num_tokens = params.num_tokens
+            leaves = list(self.evictable_leaves)
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node) for node in leaves
+            ]
+            heapq.heapify(eviction_heap)
+
+            num_evicted = 0
+            skipped_protected = 0
+
+            while num_evicted < num_tokens and len(eviction_heap):
+                _priority, x = heapq.heappop(eviction_heap)
+
+                # Session TTL protection: skip nodes owned by TTL-protected sessions
+                if _is_node_protected(x):
+                    skipped_protected += 1
+                    continue  # Skip without pushing back to heap
+
+                self.token_to_kv_pool_allocator.free(x.value)
+                num_evicted += len(x.value)
+                self._delete_leaf(x)
+                # Clean up ownership tracking for the deleted node
+                _remove_node_ownership(x)
+
+                if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+                self._record_remove_event(x)
+
+            self.update_eviction_metrics(num_evicted, start_time)
+
+            if skipped_protected > 0:
+                logger.debug(
+                    f"Eviction: evicted={num_evicted} tokens, "
+                    f"skipped {skipped_protected} session-protected nodes"
+                )
+
+            from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+            return EvictResult(num_tokens_evicted=num_evicted)
+
+        if hasattr(target, 'evict'):
+            target.evict = wrapped_evict
+
+        # --- Session-aware: node ownership tracking in cache_finished_req ---
+        original_cache_finished_req = target.cache_finished_req
+
+        def wrapped_cache_finished_req(self, req, is_insert=True):
+            """Wrap cache_finished_req to track node→session ownership."""
+            # Call original method first
+            original_cache_finished_req(self, req, is_insert)
+
+            # After caching, tag the affected nodes with the request's session_id
+            sim_args = req.sampling_params.custom_params.get("simulation", {}) if hasattr(req, 'sampling_params') and req.sampling_params else {}
+            session_id = sim_args.get("session_id")
+            if session_id is None:
+                return
+
+            # Walk the prefix path from root to last_node and tag all nodes
+            # with the session_id for eviction tracking
+            node = getattr(req, 'last_node', None)
+            while node is not None and node is not self.root_node:
+                _tag_node_with_session(node, session_id)
+                node = node.parent
+
+        if hasattr(target, 'cache_finished_req'):
+            target.cache_finished_req = wrapped_cache_finished_req
 
         return target
 
@@ -2117,77 +2328,59 @@ class C_InvariantCheckerHook(BaseHook):
 
 
 class C_PoolStatsObserverHook(BaseHook):
-    """Hook to fix negative token counts in simulation mode"""
+    """Hook to fix negative token counts in simulation mode.
+
+    In HiSim simulation, the mock allocator's free() method doesn't validate
+    indices, which can cause available_size to grow larger than max_total_num_tokens.
+    This leads to negative num_used = max_total_num_tokens - (available_size + evictable_size).
+
+    The fix hooks get_pool_stats() to clamp all PoolStats fields to non-negative values.
+    """
     HOOK_CLASS_NAME = "PoolStatsObserver"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.pool_stats_observer"
 
     @classmethod
     def hook(cls, target):
-        original_update = target.update
+        original_get_pool_stats = target.get_pool_stats
 
-        def wrapped_update(self, *args, **kwargs):
-            """Fix negative token counts that occur in simulation mode"""
-            try:
-                original_update(self, *args, **kwargs)
+        def wrapped_get_pool_stats(self, *args, **kwargs):
+            """Fix negative token counts that occur in simulation mode."""
+            pool_stats = original_get_pool_stats(self, *args, **kwargs)
 
-                # Fix negative full_num_used - this can happen in simulation mode due to
-                # imprecise memory accounting where available_size exceeds total tokens
-                if hasattr(self, 'full_num_used') and self.full_num_used < 0:
-                    logger.debug(
-                        f"Fixing negative full_num_used: {self.full_num_used} -> 0 "
-                        f"(total_tokens_per_layer={getattr(self, 'full_tokens_per_layer', 'N/A')})"
-                    )
-                    self.full_num_used = 0
+            # Fix negative full_num_used and full_token_usage
+            if pool_stats.full_num_used < 0:
+                logger.debug(
+                    f"Fixing negative full_num_used: {pool_stats.full_num_used} -> 0 "
+                    f"(available={pool_stats.full_available_size}, "
+                    f"evictable={pool_stats.full_evictable_size})"
+                )
+                pool_stats.full_num_used = 0
+                pool_stats.full_token_usage = 0.0
 
-                # Fix negative swa_num_used
-                if hasattr(self, 'swa_num_used') and self.swa_num_used is not None and self.swa_num_used < 0:
-                    logger.debug(
-                        f"Fixing negative swa_num_used: {self.swa_num_used} -> 0 "
-                        f"(swa_tokens_per_layer={getattr(self, 'swa_tokens_per_layer', 'N/A')})"
-                    )
-                    self.swa_num_used = 0
+            # Fix negative swa values
+            if pool_stats.swa_num_used is not None and pool_stats.swa_num_used < 0:
+                logger.debug(f"Fixing negative swa_num_used: {pool_stats.swa_num_used} -> 0")
+                pool_stats.swa_num_used = 0
+                pool_stats.swa_token_usage = 0.0
 
-                # Fix negative token usage percentages
-                if hasattr(self, 'full_token_usage') and self.full_token_usage < 0:
-                    logger.debug(
-                        f"Fixing negative full_token_usage: {self.full_token_usage} -> 0.0"
-                    )
-                    self.full_token_usage = 0.0
+            # Fix negative mamba values
+            if pool_stats.mamba_num_used is not None and pool_stats.mamba_num_used < 0:
+                logger.debug(f"Fixing negative mamba_num_used: {pool_stats.mamba_num_used} -> 0")
+                pool_stats.mamba_num_used = 0
+                pool_stats.mamba_usage = 0.0
 
-                if hasattr(self, 'swa_token_usage') and self.swa_token_usage is not None and self.swa_token_usage < 0:
-                    logger.debug(
-                        f"Fixing negative swa_token_usage: {self.swa_token_usage} -> 0.0"
-                    )
-                    self.swa_token_usage = 0.0
+            # Fix negative hisparse values
+            if pool_stats.hisparse_device_tokens is not None and pool_stats.hisparse_device_tokens < 0:
+                logger.debug(f"Fixing negative hisparse_device_tokens: {pool_stats.hisparse_device_tokens} -> 0")
+                pool_stats.hisparse_device_tokens = 0
+                pool_stats.hisparse_device_token_usage = 0.0
 
-                # Fix negative mamba values
-                if hasattr(self, 'mamba_num_used') and self.mamba_num_used is not None and self.mamba_num_used < 0:
-                    logger.debug(f"Fixing negative mamba_num_used: {self.mamba_num_used} -> 0")
-                    self.mamba_num_used = 0
+            if pool_stats.hisparse_host_tokens is not None and pool_stats.hisparse_host_tokens < 0:
+                logger.debug(f"Fixing negative hisparse_host_tokens: {pool_stats.hisparse_host_tokens} -> 0")
+                pool_stats.hisparse_host_tokens = 0
+                pool_stats.hisparse_host_token_usage = 0.0
 
-                if hasattr(self, 'mamba_usage') and self.mamba_usage is not None and self.mamba_usage < 0:
-                    logger.debug(f"Fixing negative mamba_usage: {self.mamba_usage} -> 0.0")
-                    self.mamba_usage = 0.0
+            return pool_stats
 
-                # Fix negative hisparse values
-                if hasattr(self, 'hisparse_device_tokens') and self.hisparse_device_tokens is not None and self.hisparse_device_tokens < 0:
-                    logger.debug(f"Fixing negative hisparse_device_tokens: {self.hisparse_device_tokens} -> 0")
-                    self.hisparse_device_tokens = 0
-
-                if hasattr(self, 'hisparse_device_token_usage') and self.hisparse_device_token_usage is not None and self.hisparse_device_token_usage < 0:
-                    logger.debug(f"Fixing negative hisparse_device_token_usage: {self.hisparse_device_token_usage} -> 0.0")
-                    self.hisparse_device_token_usage = 0.0
-
-                if hasattr(self, 'hisparse_host_tokens') and self.hisparse_host_tokens is not None and self.hisparse_host_tokens < 0:
-                    logger.debug(f"Fixing negative hisparse_host_tokens: {self.hisparse_host_tokens} -> 0")
-                    self.hisparse_host_tokens = 0
-
-                if hasattr(self, 'hisparse_host_token_usage') and self.hisparse_host_token_usage is not None and self.hisparse_host_token_usage < 0:
-                    logger.debug(f"Fixing negative hisparse_host_token_usage: {self.hisparse_host_token_usage} -> 0.0")
-                    self.hisparse_host_token_usage = 0.0
-
-            except Exception as e:
-                logger.debug(f"Error in pool stats observer update: {e}. Continuing with current state.")
-
-        target.update = wrapped_update
+        target.get_pool_stats = wrapped_get_pool_stats
         return target
