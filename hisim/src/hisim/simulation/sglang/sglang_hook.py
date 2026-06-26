@@ -1473,7 +1473,8 @@ class C_SchedulerHook(BaseHook):
                             req_stats.queue_end = StateManager.get_global_clock()
 
                     # Session-aware: update session TTL when request is scheduled
-                    sim_args = req.sampling_params.custom_params.get("simulation", {})
+                    custom_params = getattr(req.sampling_params, 'custom_params', None)
+                    sim_args = custom_params.get("simulation", {}) if custom_params else {}
                     if sim_args.get("session_id") and sim_args.get("cache_control"):
                         _update_session_ttl(
                             sim_args["session_id"], sim_args["cache_control"]
@@ -2167,7 +2168,8 @@ class C_RadixCacheFixHook(BaseHook):
                 req.cache_protected_len = len(new_indices)
 
                 # Session-aware: tag nodes along the prefix path with session_id
-                sim_args = req.sampling_params.custom_params.get("simulation", {}) if hasattr(req, 'sampling_params') and req.sampling_params else {}
+                custom_params = getattr(req.sampling_params, 'custom_params', None) if hasattr(req, 'sampling_params') and req.sampling_params else None
+                sim_args = custom_params.get("simulation", {}) if custom_params else {}
                 session_id = sim_args.get("session_id")
                 if session_id is not None:
                     tag_node = new_last_node
@@ -2249,7 +2251,8 @@ class C_RadixCacheFixHook(BaseHook):
             original_cache_finished_req(self, req, is_insert)
 
             # After caching, tag the affected nodes with the request's session_id
-            sim_args = req.sampling_params.custom_params.get("simulation", {}) if hasattr(req, 'sampling_params') and req.sampling_params else {}
+            custom_params = getattr(req.sampling_params, 'custom_params', None) if hasattr(req, 'sampling_params') and req.sampling_params else None
+            sim_args = custom_params.get("simulation", {}) if custom_params else {}
             session_id = sim_args.get("session_id")
             if session_id is None:
                 return
