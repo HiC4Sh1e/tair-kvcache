@@ -59,9 +59,11 @@ class RequestStats:
     queue_start: float = -1
     queue_end: float = -1
     created_time: float = -1
+    absolute_created_time: float = -1  # Store absolute timestamp for reference
     gen_token_latencies: list[float] = field(default_factory=list)
     session_id: Optional[str] = None
     parent_session_id: Optional[str] = None
+    memory_hit_tokens: int = 0
 
     def is_complete(self) -> bool:
         return True

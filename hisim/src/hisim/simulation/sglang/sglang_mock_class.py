@@ -321,6 +321,20 @@ class MockTokenToKVPool:
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        # Fix: Validate and sanitize size parameter to prevent negative values
+        # This can occur when chunked prefill size is very large (e.g., 196K)
+        # causing memory estimation calculations to produce negative values
+        if size <= 0:
+            raise ValueError(
+                f"TokenToKVPool size must be positive, got size={size}. "
+                f"This may be caused by invalid chunked prefill size configuration. "
+                f"Try reducing chunked_prefill_size or adjusting memory settings."
+            )
+        if page_size <= 0:
+            raise ValueError(
+                f"TokenToKVPool page_size must be positive, got page_size={page_size}"
+            )
+
         self.size = size
         self.page_size = page_size
         self.dtype = dtype

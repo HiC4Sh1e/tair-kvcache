@@ -926,6 +926,7 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
     mean_queue_ms: float = 0.0
     prefix_cache_reused_ratio: float = 0.0
+    memory_prefetch_ratio: float = 0.0
     disk_prefetch_ratio: float = 0.0
 
 
@@ -1716,7 +1717,7 @@ def sample_generated_shared_prefix_requests(
 
 
 def sample_hisim_collection_requests(
-    dataset_path: str, num_requests: int, tokenizer: PreTrainedTokenizerBase
+    dataset_path: str, num_requests: int, tokenizer: Optional[PreTrainedTokenizerBase] = None
 ):
     if not dataset_path or not os.path.exists(dataset_path):
         raise ValueError(
@@ -1752,14 +1753,25 @@ def sample_hisim_collection_requests(
         # Calculate input_length if not present (for JSONL datasets with only input_ids)
         if "input_length" in item:
             input_length = item["input_length"]
+            # Get input_ids for cache matching - important for accurate KVCache hit rate
+            input_ids = item.get("input_ids", [])
         else:
             # Calculate from input_ids array
             input_ids = item.get("input_ids", [])
             input_length = len(input_ids) if isinstance(input_ids, list) else item.get("prompt_len", 0)
 
+        # Use real input_ids for accurate KVCache prefix matching and hit rate calculation
+        # In simulation mode, we pass input_ids directly as the prompt (list format)
+        # The server will treat it as pre-tokenized and use it for cache matching
+        if isinstance(input_ids, list) and len(input_ids) > 0:
+            prompt = input_ids
+        else:
+            # Fallback to dummy list if input_ids not available
+            prompt = [100] * input_length
+
         input_requests.append(
             DatasetRow(
-                prompt=tokenizer.decode(item["input_ids"]),
+                prompt=prompt,  # Real input_ids list for accurate cache matching
                 prompt_len=input_length,
                 output_len=item["output_length"],
                 timestamp=item[timestamp_field_name],
@@ -1838,8 +1850,8 @@ def calculate_metrics(
     input_requests: List[DatasetRow],
     outputs: List[RequestFuncOutput],
     dur_s: float,
-    tokenizer: PreTrainedTokenizerBase,
-    backend: str,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    backend: str = "sglang",
     accept_length: Optional[float] = None,
     plot_throughput: bool = False,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
@@ -1865,16 +1877,20 @@ def calculate_metrics(
         if outputs[i].success:
             output_len = outputs[i].output_len
             output_lens.append(output_len)
-            retokenized_output_len = len(
-                tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
-            )
+            # Retokenization is only needed if tokenizer is available
+            if tokenizer is not None:
+                retokenized_output_len = len(
+                    tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
+                )
+            else:
+                retokenized_output_len = output_len
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i].prompt_len
             total_input_text += input_requests[i].text_prompt_len
             total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
-            if use_retokenized_itl:
+            if use_retokenized_itl and tokenizer is not None:
                 for k, itl in enumerate(outputs[i].itl):
                     num_tokens = len(
                         tokenizer.encode(
@@ -2010,24 +2026,127 @@ def calculate_metrics(
 
 
 def load_simulation_metrics() -> BenchmarkMetrics | None:
-    out_dir = os.getenv("HISIM_OUTPUT_DIR", "/tmp/hisim/output/")
-    metrics_path = os.path.join(out_dir, "metrics.json")
-    if not os.path.exists(metrics_path):
-        print(f"Fail to get simmulation metrics from {out_dir}")
+    # Fix: Try both possible output directories to handle path mismatch
+    possible_dirs = []
+    output_dir_env = os.getenv("HISIM_OUTPUT_DIR")
+    if output_dir_env:
+        possible_dirs.append(output_dir_env)
+    # Add common default paths
+    possible_dirs.extend(["/tmp/hisim/output/", "/tmp/hisim/simulation/"])
+
+    metrics_data = None
+    metrics_path = None
+    for out_dir in possible_dirs:
+        metrics_path = os.path.join(out_dir, "metrics.json")
+        if os.path.exists(metrics_path):
+            try:
+                with open(metrics_path) as f:
+                    metrics_data = json.load(f)
+                break
+            except Exception as e:
+                # Try next directory
+                continue
+
+    if metrics_data is None:
+        print(f"Failed to load simulation metrics from any of {possible_dirs}")
         return None
 
     try:
-        with open(metrics_path) as f:
-            data = json.load(f)
-
         metrics_fields = {f.name for f in fields(BenchmarkMetrics)}
         # -1 means invalid value.
-        kwargs = {k: data.get(k, -1) for k in metrics_fields}
+        kwargs = {k: metrics_data.get(k, -1) for k in metrics_fields}
 
         kwargs.update({"bench_mode": "simulation"})
         return BenchmarkMetrics(**kwargs)
     except Exception as e:
-        print(f"Failed to load simulation metrics from {metrics_path}: {e}")
+        print(f"Failed to parse simulation metrics from {metrics_path}: {e}")
+        return None
+
+
+def get_cache_stats_from_file() -> dict | None:
+    """从文件读取cache统计信息（用于不使用profiling的情况）"""
+    try:
+        # 尝试从可能的输出目录读取cache统计文件
+        possible_dirs = []
+        output_dir_env = os.getenv("HISIM_OUTPUT_DIR")
+        if output_dir_env:
+            possible_dirs.append(output_dir_env)
+        # Add common default paths
+        possible_dirs.extend(["/tmp/hisim/output/", "/tmp/hisim/simulation/"])
+
+        for out_dir in possible_dirs:
+            cache_stats_path = os.path.join(out_dir, "cache_stats.json")
+            print(f"DEBUG: Looking for cache stats at {cache_stats_path}")
+            if os.path.exists(cache_stats_path):
+                try:
+                    with open(cache_stats_path) as f:
+                        stats_data = json.load(f)
+                    print(f"DEBUG: Found cache stats: {stats_data}")
+                    return stats_data
+                except Exception as e:
+                    print(f"DEBUG: Failed to load cache stats from {cache_stats_path}: {e}")
+                    continue
+
+        print(f"DEBUG: No cache stats file found in any of {possible_dirs}")
+        return None
+    except Exception as e:
+        print(f"Failed to get cache stats from file: {e}")
+        return None
+
+
+def get_cache_stats_from_server(base_url: str) -> dict | None:
+    """获取服务端cache统计信息（不依赖profiling）"""
+    import sys
+    try:
+        print(f"DEBUG: Attempting to get cache stats from {base_url}")
+
+        # 首先尝试从文件读取（这是主要方式）
+        file_stats = get_cache_stats_from_file()
+        if file_stats is not None:
+            return file_stats
+
+        # 回退到HTTP查询（可能不支持多进程环境）
+        # 尝试从服务端获取cache统计
+        # 先尝试 get_server_info（可能包含cache信息）
+        resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers(), timeout=5)
+        print(f"DEBUG: get_server_info response status: {resp.status_code}")
+        if resp.status_code == 200:
+            server_info = resp.json()
+            print(f"DEBUG: get_server_info keys: {list(server_info.keys())}")
+            # 检查是否有cache统计信息
+            if "cache_stats" in server_info:
+                print(f"DEBUG: Found cache_stats in get_server_info response")
+                return server_info["cache_stats"]
+
+        # 提取原服务的端口和主机
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        host = parsed.netloc.split(':')[0] if ':' in parsed.netloc else parsed.netloc
+
+        # 尝试专门的cache统计endpoint (在 port+10 上)
+        # 使用相同的主机，但端口+10
+        if ':' in parsed.netloc:
+            port = int(parsed.netloc.split(':')[1])
+            cache_stats_url = f"http://{host}:{port + 10}/get_cache_stats"
+        else:
+            # 如果没有指定端口，默认推导
+            cache_stats_url = f"http://{host}:30035/get_cache_stats"
+
+        print(f"DEBUG: Trying cache stats URL: {cache_stats_url}")
+        resp2 = requests.get(cache_stats_url, timeout=5)
+        print(f"DEBUG: get_cache_stats response status: {resp2.status_code}")
+        if resp2.status_code == 200:
+            data = resp2.json()
+            print(f"DEBUG: get_cache_stats response: {data}")
+            return data
+        else:
+            print(f"DEBUG: get_cache_stats failed with status {resp2.status_code}, body: {resp2.text}")
+
+        return None
+    except Exception as e:
+        import traceback
+        print(f"Failed to get cache stats from server: {e}")
+        print(f"DEBUG: Exception traceback: {traceback.format_exc()}")
         return None
 
 
@@ -2036,8 +2155,6 @@ async def benchmark(
     api_url: str,
     base_url: str,
     model_id: str,
-    tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[DatasetRow],
     request_rate: float,
     max_concurrency: Optional[int],
     disable_tqdm: bool,
@@ -2046,6 +2163,7 @@ async def benchmark(
     lora_zipf_alpha: Optional[float],
     extra_request_body: Dict[str, Any],
     profile: bool,
+    input_requests: List[DatasetRow],
     pd_separated: bool = False,
     flush_cache: bool = False,
     warmup_requests: int = 1,
@@ -2054,6 +2172,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -2087,7 +2206,8 @@ async def benchmark(
         prompt_text += "Can you tell me a detailed story in 1000 words?"
 
         output_len = warmup_record.get("output_length", 32)
-        prompt_len = len(tokenizer.encode(prompt_text))
+        # Note: if tokenizer is None (simulation mode + hisim-collection), this won't be used
+        prompt_len = len(tokenizer.encode(prompt_text)) if tokenizer else len(prompt_text)
 
         # Create a temporary DatasetRow object for warmup
         test_request = DatasetRow(
@@ -2148,7 +2268,7 @@ async def benchmark(
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
-    if profile and pd_separated:
+    if getattr(args, 'profile', False) and pd_separated:
         pd_profile_urls = _build_profile_urls(profile_prefill_url, profile_decode_url)
         if not pd_profile_urls:
             print(
@@ -2156,8 +2276,19 @@ async def benchmark(
             )
             print("Skipping profiler start. Please specify worker URLs for profiling.")
 
-    # Start profiler
-    if profile:
+    # Start profiler or simulation
+    if args.bench_mode == "simulation" and args.enable_profiling:
+        # In simulation mode, /start_profile starts collecting stats
+        print("Starting simulation profiling...")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile"
+        )
+        if profile_output.success:
+            print("Simulation profiling started")
+        else:
+            print(f"Warning: Failed to start simulation profiling: {profile_output.error}")
+    elif profile and (not args.bench_mode == "simulation") and args.enable_profiling:
+        # In normal mode with --profile flag, start torch profiler
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "start")
@@ -2168,13 +2299,8 @@ async def benchmark(
             )
             if profile_output.success:
                 print("Profiler started")
-
-    if args.bench_mode == "simulation":
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
-        if profile_output.success:
-            print("Simulation triggered")
+    elif not args.enable_profiling:
+        print("Profiling disabled. Metrics will be calculated from client-side results only.")
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -2245,8 +2371,19 @@ async def benchmark(
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
-    # Stop profiler
-    if profile:
+    # Stop profiler or simulation
+    if args.bench_mode == "simulation" and args.enable_profiling:
+        # In simulation mode, /stop_profile stops stats collection and generates metrics
+        print("Stopping simulation profiling and generating metrics...")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/stop_profile"
+        )
+        if profile_output.success:
+            print("Simulation stopped and metrics generated successfully")
+        else:
+            print(f"Warning: Failed to stop simulation profiling: {profile_output.error}")
+    elif profile and (not args.bench_mode == "simulation") and args.enable_profiling:
+        # In normal mode with --profile flag, stop torch profiler
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
@@ -2258,13 +2395,6 @@ async def benchmark(
                 )
                 if profile_output.success:
                     print("Profiler stopped")
-
-    if args.bench_mode == "simulation":
-        profile_output = await async_request_profile(
-            api_url=base_url + "/start_profile"
-        )
-        if profile_output.success:
-            print("Simulation stop triggered")
 
     if pbar is not None:
         pbar.close()
@@ -2303,12 +2433,26 @@ async def benchmark(
         plot_throughput=args.plot_throughput,
     )
     if args.bench_mode == "simulation":
-        # Get the real metrics from the server, because the server metrics are not reliable during simulation.
-        sim_metrics = load_simulation_metrics()
-        if sim_metrics is not None:
-            metrics = sim_metrics
+        # 尝试获取服务端生成的统计信息（包括cache命中率）
+        if args.enable_profiling:
+            # 使用完整的profiling，从文件加载metrics
+            sim_metrics = load_simulation_metrics()
+            if sim_metrics is not None:
+                metrics = sim_metrics
+                print("Using server-generated simulation metrics")
+            else:
+                print("Warning: Failed to load simulation metrics, using calculated metrics for display")
         else:
-            print("Warning: Failed to load simulation metrics, using calculated metrics for display")
+            # 不使用profiling，尝试从服务端获取cache统计
+            cache_stats = get_cache_stats_from_server(base_url)
+            if cache_stats is not None:
+                # 更新metrics的cache相关字段
+                metrics.prefix_cache_reused_ratio = cache_stats.get('prefix_cache_reused_ratio', 0.0)
+                metrics.memory_prefetch_ratio = cache_stats.get('memory_prefetch_ratio', 0.0)
+                metrics.disk_prefetch_ratio = cache_stats.get('disk_prefetch_ratio', 0.0)
+                print("Cache statistics loaded from server")
+            else:
+                print("Profiling is disabled. Cache statistics not available (hit rates will be 0).")
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Benchmark Mode:", metrics.bench_mode))
@@ -2397,6 +2541,10 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    print("{s:{c}^{n}}".format(s="KVCache Hit Statistics", n=50, c="-"))
+    print("{:<40} {:<10.2%}".format("HBM (GPU) prefix cache hit rate:", metrics.prefix_cache_reused_ratio))
+    print("{:<40} {:<10.2%}".format("Memory cache hit rate:", metrics.memory_prefetch_ratio))
+    print("{:<40} {:<10.2%}".format("Disk cache hit rate:", metrics.disk_prefetch_ratio))
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
@@ -2455,6 +2603,7 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "prefix_cache_reused_ratio": metrics.prefix_cache_reused_ratio,
+            "memory_prefetch_ratio": metrics.memory_prefetch_ratio,
             "disk_prefetch_ratio": metrics.disk_prefetch_ratio,
         }
     else:
@@ -2497,15 +2646,6 @@ async def benchmark(
         file.write(json.dumps(result_for_dump) + "\n")
 
     return result | result_details
-
-
-def check_chat_template(model_path):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
-    except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
-        return False
 
 
 def set_global_args(args_: argparse.Namespace):
@@ -2649,11 +2789,14 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
-        )
+    # Optimization: Remove check_chat_template to avoid duplicate tokenizer loading
+    # The first tokenizer load (in check_chat_template) takes 2-5s and is immediately discarded
+    # We'll use the tokenizer loaded later in get_tokenizer() instead
+    # if not check_chat_template(args.model):
+    #     print(
+    #         "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+    #         "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+    #     )
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
@@ -2675,9 +2818,20 @@ def run_benchmark(args_: argparse.Namespace):
     # Read dataset
     backend = args.backend
     model_id = args.served_model_name or args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
-    tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer, model_id)
+
+    # Optimization: Skip tokenizer loading in simulation mode for hisim-collection dataset
+    # The hisim-collection dataset already contains input_ids and doesn't need tokenizer
+    # Tokenizer loading typically takes 2-5 seconds, which is wasteful in this case
+    if args.bench_mode == "simulation" and args.dataset_name == "hisim-collection":
+        print("Skipping tokenizer loading: simulation mode with hisim-collection dataset")
+        tokenizer = None
+        input_requests = sample_hisim_collection_requests(
+            args.dataset_path, args.num_prompts, tokenizer=None
+        )
+    else:
+        tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+        tokenizer = get_tokenizer(tokenizer_id)
+        input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
@@ -2946,6 +3100,19 @@ if __name__ == "__main__":
         "--plot-throughput",
         action="store_true",
         help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
+    )
+    parser.add_argument(
+        "--enable-profiling",
+        action="store_true",
+        default=True,
+        help="Enable profiling to collect simulation metrics and generate metrics.json. "
+        "Set --no-enable-profiling to disable metrics generation in simulation mode (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-enable-profiling",
+        action="store_false",
+        dest="enable_profiling",
+        help="Disable simulation profiling (alias for --no-enable-profiling).",
     )
     # TODO unify all these
     parser.add_argument(

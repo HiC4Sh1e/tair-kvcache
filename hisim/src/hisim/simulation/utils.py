@@ -40,7 +40,7 @@ def estimate_kv_cache_pool_capacity(
 
             return 0
 
-    
+
 
     class MockConfig:
 
@@ -48,7 +48,7 @@ def estimate_kv_cache_pool_capacity(
 
             self.pp_size = scheduler_config.pp_size
 
-    
+
 
     class MockPerfModel:
 
@@ -58,7 +58,7 @@ def estimate_kv_cache_pool_capacity(
 
             self.context_ops = [MockContextOp()]
 
-    
+
 
     perf_model = MockPerfModel()
 
@@ -72,13 +72,43 @@ def estimate_kv_cache_pool_capacity(
         scheduler_config.mem_fraction_static * device.hbm_capacity_gb
         - framework_reserved_mem_gb
     ) * (1 << 30) - weights
+
+    # Fix: Add validation for rest_memory to prevent negative capacity
+    if rest_memory <= 0:
+        raise ValueError(
+            f"Insufficient available memory for KV cache. "
+            f"Device capacity: {device.hbm_capacity_gb}GB, "
+            f"Mem fraction: {scheduler_config.mem_fraction_static}, "
+            f"Framework reserved: {framework_reserved_mem_gb}GB, "
+            f"Available for KV cache: {rest_memory / (1 << 30):.2f}GB. "
+            f"Consider reducing mem_fraction_static or using a smaller model."
+        )
+
     kv_cache_space_per_token = (
         calc_kv_cache_cell_elems(
             model, scheduler_config.tp_size, scheduler_config.pp_size
         )
         * scheduler_config.kv_cache_data_type.bytes
     )
-    return int(rest_memory / kv_cache_space_per_token)
+
+    if kv_cache_space_per_token <= 0:
+        raise ValueError(
+            f"Invalid KV cache space per token: {kv_cache_space_per_token} bytes. "
+            f"This may be caused by invalid model parameters."
+        )
+
+    capacity = int(rest_memory / kv_cache_space_per_token)
+
+    # Fix: Add validation for calculated capacity
+    if capacity <= 0:
+        raise ValueError(
+            f"Calculated KV cache capacity is non-positive: {capacity}. "
+            f"This may be caused by insufficient memory or invalid configuration. "
+            f"Available memory: {rest_memory / (1 << 30):.2f}GB, "
+            f"Space per token: {kv_cache_space_per_token} bytes."
+        )
+
+    return capacity
 
 
 def calc_metrics(requests: list[RequestStats]) -> dict:
@@ -92,6 +122,7 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     completed = 0
     total_reused_tokens = 0
     total_disk_hit_tokens = 0
+    total_memory_hit_tokens = 0
     queue_durs = []
     # Session-aware metrics
     session_ids = set()
@@ -114,6 +145,7 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         total_output += req.output_length
         total_reused_tokens += req.final_reused_tokens
         total_disk_hit_tokens += req.prefetch_complete_tokens
+        total_memory_hit_tokens += req.memory_hit_tokens
         # Session metrics
         if req.session_id is not None:
             session_ids.add(req.session_id)
@@ -133,6 +165,9 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "prefix_cache_reused_ratio": 0
         if total_input == 0
         else total_reused_tokens / total_input,
+        "memory_prefetch_ratio": 0
+        if total_input == 0
+        else total_memory_hit_tokens / total_input,
         "disk_prefetch_ratio": 0
         if total_input == 0
         else total_disk_hit_tokens / total_input,

@@ -82,8 +82,10 @@ class ConfigManager:
             platform_config = config.get("platform", {})
             cls._platform_config = PlatformConfig(
                 device=hw,
+                disk_capacity_gb=platform_config.get("disk_capacity_gb"),
                 disk_read_bandwidth_gb=platform_config.get("disk_read_bandwidth_gb"),
                 disk_write_bandwidth_gb=platform_config.get("disk_write_bandwidth_gb"),
+                memory_capacity_gb=platform_config.get("memory_capacity_gb"),
                 memory_read_bandwidth_gb=platform_config.get(
                     "memory_read_bandwidth_gb"
                 ),
@@ -146,6 +148,81 @@ class ConfigManager:
         dp_size = scheduler_config.get("dp_size")
         if dp_size is None:
             dp_size = internal_config.dp_size
+
+        # Fix: Handle mem_fraction_static default value
+        # If not set in config, use reasonable default based on hardware
+        internal_mem_fraction = internal_config.mem_fraction_static
+        config_mem_fraction = scheduler_config.get("mem_fraction_static")
+
+        # Determine target requirements: need at least 196K tokens for large requests
+        min_required_tokens = 196000  # Minimum required for 196K chunked prefill
+
+        if config_mem_fraction is not None:
+            mem_fraction_static = max(0.1, min(0.95, config_mem_fraction))  # Clamp to reasonable range
+            logger.info(f"Using mem_fraction_static from config: {mem_fraction_static}")
+        elif internal_mem_fraction is not None:
+            mem_fraction_static = max(0.1, min(0.95, internal_mem_fraction))  # Clamp to reasonable range
+            logger.info(f"Using mem_fraction_static from server args: {mem_fraction_static}")
+        else:
+            # Default to 0.9 (90% of HBM for KV cache)
+            mem_fraction_static = 0.9
+            logger.info(f"Using default mem_fraction_static: {mem_fraction_static}")
+
+        # Fix: Check if the current mem_fraction_static provides sufficient capacity
+        # If SGLang set a very low value (like 0.1) due to large chunked_prefill_size,
+        # we need to override it for HiSim simulation to ensure sufficient token capacity
+        need_capacity_override = False
+        if mem_fraction_static < 0.5:  # If less than 50%, it might be too small for large requests
+            # Calculate expected capacity with current mem_fraction_static
+            try:
+                from hisim.simulation.utils import estimate_kv_cache_pool_capacity
+                # Note: SchedulerConfig is already imported at module level
+
+                # Create temporary config to check capacity
+                temp_config = SchedulerConfig(
+                    model=model,
+                    max_prefill_tokens=internal_config.max_prefill_tokens,
+                    chunked_prefill_size=internal_config.chunked_prefill_size,
+                    mem_fraction_static=mem_fraction_static,
+                    tp_size=tp_size,
+                    ep_size=ep_size,
+                    dp_size=dp_size,
+                    data_type=DataType.FP16,  # Use FP16 for estimation
+                    kv_cache_data_type=DataType.FP16,
+                    page_size=internal_config.page_size,
+                    backend_name="sglang",
+                )
+
+                temp_hw = ConfigManager.get_accelerator_info()
+                estimated_capacity = estimate_kv_cache_pool_capacity(model, temp_hw, temp_config)
+
+                logger.info(f"Estimated KV cache capacity with mem_fraction_static={mem_fraction_static}: {estimated_capacity} tokens")
+
+                # If capacity is insufficient for 196K requirement, override to 0.9
+                if estimated_capacity < min_required_tokens:
+                    need_capacity_override = True
+                    logger.warning(
+                        f"Insufficient capacity ({estimated_capacity} tokens) with mem_fraction_static={mem_fraction_static} "
+                        f"for required {min_required_tokens} tokens. This is likely caused by SGLang's "
+                        f"automatic mem_fraction_static calculation for large chunked_prefill_size. "
+                        f"Overriding to 0.9 for HiSim simulation."
+                    )
+            except Exception as e:
+                logger.warning(f"Could not estimate capacity: {e}. Using fallback logic.")
+
+        # Apply override if needed based on simple heuristic (calculation failed or insufficient capacity)
+        if need_capacity_override or mem_fraction_static < 0.5:
+            override_fraction = 0.9
+            mem_fraction_static = override_fraction
+            if need_capacity_override:
+                logger.info(f"Overridden mem_fraction_static to {override_fraction} for sufficient capacity")
+            else:
+                logger.warning(
+                    f"mem_fraction_static={mem_fraction_static} seems too low. "
+                    f"If SGLang calculated this based on large chunked_prefill_size, "
+                    f"overriding to {override_fraction} for HiSim simulation."
+                )
+                mem_fraction_static = override_fraction
         dtype = scheduler_config.get("data_type")
         if dtype is not None:
             dtype = DataType(dtype.upper())
@@ -166,6 +243,9 @@ class ConfigManager:
 
         logger.info(f"HISIM_DEBUG: model.model_type after fix = {model.model_type}")
 
+        # Pass the validated mem_fraction_static to scheduler config
+        logger.info(f"FINAL: mem_fraction_static = {mem_fraction_static}")
+
         # Read context_length from config and apply to model if specified
         context_length = scheduler_config.get("context_length")
         if context_length is not None:
@@ -176,11 +256,29 @@ class ConfigManager:
                 model.max_position_embeddings = context_length
             logger.info(f"Applied context_length from config: {context_length}")
 
+        # Read hicache configuration from scheduler config
+        hicache_storage_backend = scheduler_config.get("hicache_storage_backend")
+        if hicache_storage_backend is not None:
+            logger.info(f"HiCache storage backend enabled: {hicache_storage_backend}")
+        else:
+            logger.info("HiCache storage backend not configured (memory/disk prefix cache disabled)")
+
+        hicache_storage_prefetch_policy = scheduler_config.get(
+            "hicache_storage_prefetch_policy", "best_effort"
+        )
+        logger.info(f"HiCache prefetch policy: {hicache_storage_prefetch_policy}")
+
+        enable_hierarchical_cache = scheduler_config.get("enable_hierarchical_cache", False)
+        if enable_hierarchical_cache:
+            logger.info("Hierarchical cache enabled (HiRadixCache will be used for L1)")
+        else:
+            logger.info("Hierarchical cache disabled (standard RadixCache will be used)")
+
         sched_config = SchedulerConfig(
             model=model,
             max_prefill_tokens=internal_config.max_prefill_tokens,
             chunked_prefill_size=internal_config.chunked_prefill_size,
-            mem_fraction_static=internal_config.mem_fraction_static,
+            mem_fraction_static=mem_fraction_static,  # Fix: Use validated value instead of internal_config.mem_fraction_static
             tp_size=tp_size,
             ep_size=ep_size,
             dp_size=dp_size,
@@ -191,6 +289,8 @@ class ConfigManager:
             backend_name=backend,
             backend_version=scheduler_config.get("backend_version"),
             context_length=context_length,
+            hicache_storage_backend=hicache_storage_backend,
+            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
         )
         return sched_config
 
@@ -267,5 +367,10 @@ class ConfigManager:
                 offload_config_path=offload_config_path,
                 runtime_config=runtime_config,
             )
+        elif predictor_config.get("name") == "simple":
+            if HAS_SIMPLE_PREDICTOR:
+                logger.info("Using SimpleTimePredictor as specified in config")
+                return SimpleTimePredictor(model, hw, sched_config)
+            raise ValueError("SimpleTimePredictor not available")
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

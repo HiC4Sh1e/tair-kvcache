@@ -3,10 +3,10 @@
         "accelerator": {
             "name": "H20"
         },
-        "disk_capacity_gb": 1000,
+	    "disk_capacity_gb": 1024,
         "disk_read_bandwidth_gb": 8,
         "disk_write_bandwidth_gb": 8,
-        "memory_capacity_gb": 512,
+	    "memory_capacity_gb": 512,
         "memory_read_bandwidth_gb": 16,
         "memory_write_bandwidth_gb": 16,
         "num_device_per_node": 8
@@ -19,8 +19,15 @@
         "ep_size": 1,
         "dp_size": 1,
         "backend_version": "0.5.6.post2",
+        "mem_fraction_static": 0.9,
+        "enable_hierarchical_cache": true,
         "hicache_storage_backend": "file://",
-        "hicache_storage_prefetch_policy": "best_effort"
+        "hicache_storage_prefetch_policy": "best_effort",
+        "hicache_ratio": 2.0,
+        "hicache_size": 100,
+        "hicache_io_backend": "direct",
+        "hicache_write_policy": "write_through",
+        "hicache_mem_layout": "layer_first"
     },
     "model": {
         "name": "Qwen3-32B"

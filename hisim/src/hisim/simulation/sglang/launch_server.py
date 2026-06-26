@@ -1,4 +1,9 @@
 import os
+
+# Bypass flashinfer version mismatch check for SGLang 0.5.13 compatibility
+os.environ['FLASHINFER_DISABLE_VERSION_CHECK'] = '1'
+
+import json
 import json
 import sys
 import argparse
@@ -24,6 +29,7 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_HiRadixCacheHook,
         sglang_hook.C_RadixCacheFixHook,
         sglang_hook.C_InvariantCheckerHook,
+        sglang_hook.C_PoolStatsObserverHook,
     ]
 )
 
@@ -70,6 +76,50 @@ if __name__ == "__main__":
         with open(config_path, "w") as f:
             json.dump(simulation_args.to_dict(), f)
         os.environ["HISIM_CONFIG_PATH"] = config_path
+
+    # Apply HiCache configuration from config file to server_args
+    # This enables memory and disk prefix cache matching
+    if config_path and os.path.exists(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+        scheduler_config = config.get("scheduler", {})
+
+        # Set enable_hierarchical_cache first (required to use HiCache)
+        enable_hierarchical_cache = scheduler_config.get("enable_hierarchical_cache", False)
+        if enable_hierarchical_cache:
+            setattr(server_args, "enable_hierarchical_cache", True)
+            logger.info("Applied enable_hierarchical_cache from config: True")
+
+        # Set hicache_storage_backend if configured
+        hicache_storage_backend = scheduler_config.get("hicache_storage_backend")
+        if hicache_storage_backend is not None:
+            # Require additional HiCache parameters to be set for proper functioning
+            hicache_ratio = scheduler_config.get("hicache_ratio")
+            hicache_size = scheduler_config.get("hicache_size")
+            hicache_io_backend = scheduler_config.get("hicache_io_backend", "direct")
+            hicache_write_policy = scheduler_config.get("hicache_write_policy", "write_through")
+            hicache_mem_layout = scheduler_config.get("hicache_mem_layout", "layer_first")
+
+            if hicache_ratio is None or hicache_size is None:
+                logger.warning(
+                    "hicache_storage_backend is set but hicache_ratio or hicache_size is missing. "
+                    "Disabling HiCache storage to avoid compatibility issues."
+                )
+                setattr(server_args, "hicache_storage_backend", None)
+            else:
+                setattr(server_args, "hicache_storage_backend", hicache_storage_backend)
+                setattr(server_args, "hicache_ratio", hicache_ratio)
+                setattr(server_args, "hicache_size", hicache_size)
+                setattr(server_args, "hicache_io_backend", hicache_io_backend)
+                setattr(server_args, "hicache_write_policy", hicache_write_policy)
+                setattr(server_args, "hicache_mem_layout", hicache_mem_layout)
+                logger.info(f"Applied HiCache configuration: backend={hicache_storage_backend}, ratio={hicache_ratio}, size={hicache_size}")
+
+        # Set hicache_storage_prefetch_policy if configured
+        hicache_storage_prefetch_policy = scheduler_config.get("hicache_storage_prefetch_policy")
+        if hicache_storage_prefetch_policy is not None:
+            setattr(server_args, "hicache_storage_prefetch_policy", hicache_storage_prefetch_policy)
+            logger.info(f"Applied hicache_storage_prefetch_policy from config: {hicache_storage_prefetch_policy}")
 
     # Auto-register model and hardware from config if using inference_predictor
     if config_path and os.path.exists(config_path):
@@ -169,6 +219,44 @@ if __name__ == "__main__":
             logger.info(f"Applied context_length from config: {context_length}")
 
     try:
+        # 添加简单的HTTP server用于提供统计信息
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
+        import json as json_lib
+
+        class CacheStatsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/get_cache_stats':
+                    try:
+                        # 从Scheduler获取cache统计
+                        stats = sglang_hook.C_SchedulerHook.get_current_cache_stats()
+
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json_lib.dumps(stats).encode())
+                    except Exception as e:
+                        logger.error(f"Error serving cache stats: {e}")
+                        self.send_response(500)
+                        self.end_headers()
+                        self.wfile.write(json_lib.dumps({'error': str(e)}).encode())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        # 启动简单的HTTP server用于cache统计查询
+        # 复用服务绑定的端口-1（如果可用）或者使用固定端口
+        stats_server_port = server_args.port + 10
+        try:
+            stats_server = HTTPServer(('127.0.0.1', stats_server_port), CacheStatsHandler)
+            stats_server_thread = threading.Thread(target=stats_server.serve_forever, daemon=True)
+            stats_server_thread.start()
+            logger.info(f"Cache stats server started on port {stats_server_port}")
+        except Exception as e:
+            logger.warning(f"Failed to start cache stats server: {e}")
+
+        # 启动主要的服务
         launch_server(server_args)
+
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
