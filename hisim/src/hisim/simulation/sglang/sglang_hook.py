@@ -1465,7 +1465,21 @@ class C_SchedulerHook(BaseHook):
 
                 for req in new_batch.reqs:
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                    req_stats.final_reused_tokens = req.cached_tokens
+                    # Use per-level cache breakdown if available (HiRadixCache).
+                    # SGLang provides cached_tokens_device (L1/HBM),
+                    # cached_tokens_host (L2/Memory), cached_tokens_storage (L3/Disk).
+                    # Without HiCache, these default to 0 and cached_tokens is the L1 total.
+                    if hasattr(req, 'cached_tokens_device'):
+                        req_stats.final_reused_tokens = req.cached_tokens_device
+                        req_stats.memory_hit_tokens = getattr(req, 'cached_tokens_host', 0)
+                        # storage hits come from prefetch_complete_tokens (set by C_HiCacheController)
+                        # but also track via cached_tokens_storage for completeness
+                        storage_from_breakdown = getattr(req, 'cached_tokens_storage', 0)
+                        if storage_from_breakdown > 0 and req_stats.prefetch_complete_tokens == 0:
+                            req_stats.prefetch_complete_tokens = storage_from_breakdown
+                    else:
+                        # No HiCache — all cached tokens are L1 (HBM)
+                        req_stats.final_reused_tokens = req.cached_tokens
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                             req_stats.queue_end = now
