@@ -1769,12 +1769,22 @@ def sample_hisim_collection_requests(
             # Fallback to dummy list if input_ids not available
             prompt = [100] * input_length
 
+        # Build simulation dict with session-aware info from JSONL
+        simulation = {}
+        if "session_id" in item:
+            simulation["session_id"] = item["session_id"]
+        if "parent_session_id" in item:
+            simulation["parent_session_id"] = item["parent_session_id"]
+        if "cache_control" in item:
+            simulation["cache_control"] = item["cache_control"]
+
         input_requests.append(
             DatasetRow(
                 prompt=prompt,  # Real input_ids list for accurate cache matching
                 prompt_len=input_length,
                 output_len=item["output_length"],
                 timestamp=item[timestamp_field_name],
+                simulation=simulation,
             )
         )
         min_timestamp = min(min_timestamp, item[timestamp_field_name])
