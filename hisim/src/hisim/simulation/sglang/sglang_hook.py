@@ -645,6 +645,13 @@ class C_HiCacheController(BaseHook):
                 # update request states
                 req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
                 req_stats.prefetch_complete_tokens = operation.completed_tokens
+                # Write to prefetch_loaded_tokens_by_reqid so that
+                # scheduler.pop_prefetch_loaded_tokens() can return the correct
+                # value, which in turn allows schedule_batch.py to correctly
+                # subtract storage_portion from host_portion in the cache
+                # breakdown calculation. Without this, storage_hit_length=0
+                # causes all L3 tokens to be double-counted in both L2 and L3.
+                self.prefetch_loaded_tokens_by_reqid[operation.request_id] = operation.completed_tokens
 
             while remain_dur > 0:
                 try:
@@ -699,6 +706,13 @@ class C_HiCacheController(BaseHook):
                     # update request states
                     req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
                     req_stats.prefetch_complete_tokens = operation.completed_tokens
+                    # Write to prefetch_loaded_tokens_by_reqid so that
+                    # scheduler.pop_prefetch_loaded_tokens() can return the correct
+                    # value, which in turn allows schedule_batch.py to correctly
+                    # subtract storage_portion from host_portion in the cache
+                    # breakdown calculation. Without this, storage_hit_length=0
+                    # causes all L3 tokens to be double-counted in both L2 and L3.
+                    self.prefetch_loaded_tokens_by_reqid[operation.request_id] = operation.completed_tokens
                     # Release host memory after current operation is finished
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
