@@ -602,7 +602,17 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     return
 
-        def handle_prefetch_operation(self):
+        def handle_prefetch_operation(hiradix_cache=None):
+            """Handle prefetch operations for simulation.
+
+            Args:
+                hiradix_cache: The HiRadixCache instance that owns
+                    prefetch_loaded_tokens_by_reqid. When provided, completed
+                    tokens are written there so that
+                    scheduler.pop_prefetch_loaded_tokens() returns the correct value.
+                    Without this, storage_hit_length=0 causes all L3 tokens to
+                    be double-counted in both L2 and L3.
+            """
             if not self.enable_storage:
                 return
 
@@ -651,7 +661,8 @@ class C_HiCacheController(BaseHook):
                 # subtract storage_portion from host_portion in the cache
                 # breakdown calculation. Without this, storage_hit_length=0
                 # causes all L3 tokens to be double-counted in both L2 and L3.
-                self.prefetch_loaded_tokens_by_reqid[operation.request_id] = operation.completed_tokens
+                if hiradix_cache is not None:
+                    hiradix_cache.prefetch_loaded_tokens_by_reqid[operation.request_id] = operation.completed_tokens
 
             while remain_dur > 0:
                 try:
@@ -712,7 +723,8 @@ class C_HiCacheController(BaseHook):
                     # subtract storage_portion from host_portion in the cache
                     # breakdown calculation. Without this, storage_hit_length=0
                     # causes all L3 tokens to be double-counted in both L2 and L3.
-                    self.prefetch_loaded_tokens_by_reqid[operation.request_id] = operation.completed_tokens
+                    if hiradix_cache is not None:
+                        hiradix_cache.prefetch_loaded_tokens_by_reqid[operation.request_id] = operation.completed_tokens
                     # Release host memory after current operation is finished
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
@@ -915,7 +927,7 @@ class C_HiRadixCacheHook(BaseHook):
         def wrapped_check_hicache_events(self, *args, **kwargs):
             # Call operation handler first.
             self.cache_controller.handle_backup_operation()
-            self.cache_controller.handle_prefetch_operation()
+            self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
             return original_check_hicache_events(self, *args, **kwargs)
 
         target.__init__ = override_init
