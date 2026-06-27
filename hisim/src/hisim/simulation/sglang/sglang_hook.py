@@ -602,8 +602,13 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     return
 
-        def handle_prefetch_operation(hiradix_cache=None):
+        def handle_prefetch_operation(self, hiradix_cache=None):
             """Handle prefetch operations for simulation.
+
+            This function is assigned as an instance method on HiCacheController.
+            `self` is the HiCacheController instance. `hiradix_cache` is the
+            HiRadixCache instance passed from wrapped_check_hicache_events, which
+            owns prefetch_loaded_tokens_by_reqid.
 
             Args:
                 hiradix_cache: The HiRadixCache instance that owns
