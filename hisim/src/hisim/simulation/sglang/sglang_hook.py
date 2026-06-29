@@ -935,9 +935,36 @@ class C_HiRadixCacheHook(BaseHook):
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
             return original_check_hicache_events(self, *args, **kwargs)
 
+        original_evictable_size = target.evictable_size
+
+        def wrapped_evictable_size(self):
+            """Clamp evictable_size to ensure available + evictable <= max_total_num_tokens.
+
+            In simulation, evictable_size_ can be double-counted when
+            load_back() and dec_lock_ref() both increment it for the same nodes.
+            This inflates the scheduler's rem_total_tokens, allowing more
+            requests than HBM can hold.
+            """
+            raw_evictable = original_evictable_size(self)
+            # available_size is already capped by MockBaseTokenToKVPoolAllocator
+            available = self.token_to_kv_pool_allocator.available_size()
+            # token_to_kv_pool_allocator.size = max_total_num_tokens
+            max_total = self.token_to_kv_pool_allocator.size
+            max_evictable = max_total - available
+            if max_evictable < 0:
+                max_evictable = 0
+            if raw_evictable > max_evictable:
+                logger.debug(
+                    f"Clamping evictable_size: {raw_evictable} -> {max_evictable} "
+                    f"(available={available}, max_total={max_total})"
+                )
+                return max_evictable
+            return raw_evictable
+
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
+        target.evictable_size = wrapped_evictable_size
         return target
 
 
@@ -1302,7 +1329,9 @@ class C_SchedulerHook(BaseHook):
             # Fix: Sanitize mem_fraction_static to prevent invalid memory configuration
             # This happens when chunked_prefill_size is too large (e.g., 196K), causing
             # SGLang's automatic calculation (gpu_mem - reserved_mem) / gpu_mem to produce
-            # negative values or very small positive values that don't provide sufficient capacity
+            # negative values or very small positive values.
+            # All KV cache for running requests must be in HBM during inference,
+            # so we must ensure mem_fraction_static provides sufficient capacity.
             if hasattr(self, 'server_args') and hasattr(self.server_args, 'mem_fraction_static'):
                 original_fraction = self.server_args.mem_fraction_static
 
@@ -1499,17 +1528,28 @@ class C_SchedulerHook(BaseHook):
                     # Use per-level cache breakdown if available (HiRadixCache).
                     # SGLang provides cached_tokens_device (L1/HBM),
                     # cached_tokens_host (L2/Memory), cached_tokens_storage (L3/Disk).
-                    # Without HiCache, these default to 0 and cached_tokens is the L1 total.
+                    #
+                    # Cache hit rate semantics (all KV must be in HBM during inference):
+                    #   L1 (HBM)   = device + host + storage  = total cache hit rate
+                    #   L2 (Memory) = host + storage           = hierarchical cache contribution
+                    #   L3 (Disk)   = storage                  = disk cache contribution
+                    # So L3 ⊂ L2 ⊂ L1, and no double-counting is possible.
                     if hasattr(req, 'cached_tokens_device'):
-                        req_stats.final_reused_tokens = req.cached_tokens_device
-                        req_stats.memory_hit_tokens = getattr(req, 'cached_tokens_host', 0)
-                        # storage hits come from prefetch_complete_tokens (set by C_HiCacheController)
-                        # but also track via cached_tokens_storage for completeness
-                        storage_from_breakdown = getattr(req, 'cached_tokens_storage', 0)
-                        if storage_from_breakdown > 0 and req_stats.prefetch_complete_tokens == 0:
-                            req_stats.prefetch_complete_tokens = storage_from_breakdown
+                        device_portion = req.cached_tokens_device
+                        host_portion = getattr(req, 'cached_tokens_host', 0)
+                        storage_portion = getattr(req, 'cached_tokens_storage', 0)
+                        # Fallback: if storage was not set by schedule_batch but
+                        # prefetch completed, use the prefetch value
+                        if storage_portion == 0 and req_stats.prefetch_complete_tokens > 0:
+                            storage_portion = req_stats.prefetch_complete_tokens
+                        # L1 = total cache hit (all levels)
+                        req_stats.final_reused_tokens = device_portion + host_portion + storage_portion
+                        # L2 = hierarchical cache hit (L2 + L3)
+                        req_stats.memory_hit_tokens = host_portion + storage_portion
+                        # L3 = disk cache hit only
+                        req_stats.prefetch_complete_tokens = storage_portion
                     else:
-                        # No HiCache — all cached tokens are L1 (HBM)
+                        # No HiCache — all cached tokens are L1 (HBM only)
                         req_stats.final_reused_tokens = req.cached_tokens
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
@@ -2376,13 +2416,22 @@ class C_InvariantCheckerHook(BaseHook):
 
 
 class C_PoolStatsObserverHook(BaseHook):
-    """Hook to fix negative token counts in simulation mode.
+    """Hook to fix token accounting errors in simulation mode.
 
-    In HiSim simulation, the mock allocator's free() method doesn't validate
-    indices, which can cause available_size to grow larger than max_total_num_tokens.
-    This leads to negative num_used = max_total_num_tokens - (available_size + evictable_size).
+    Two issues can cause incorrect pool stats:
+    1. available_size can exceed max_total_num_tokens due to invalid free()
+       calls (duplicate frees, out-of-range indices) in the mock allocator.
+    2. evictable_size can be double-counted when load_back() and
+       dec_lock_ref() both increment evictable_size_ for the same nodes.
 
-    The fix hooks get_pool_stats() to clamp all PoolStats fields to non-negative values.
+    Both issues lead to negative num_used = max_total_num_tokens - (available + evictable).
+    More critically, the scheduler's rem_total_tokens = available + evictable can be
+    inflated, allowing more requests than HBM can hold.
+
+    The fix:
+    - Clamp available + evictable to max_total_num_tokens (physical pool capacity)
+    - Recalculate num_used and token_usage from the clamped values
+    - This ensures the scheduler's admission control sees realistic token counts
     """
     HOOK_CLASS_NAME = "PoolStatsObserver"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.pool_stats_observer"
@@ -2392,18 +2441,39 @@ class C_PoolStatsObserverHook(BaseHook):
         original_get_pool_stats = target.get_pool_stats
 
         def wrapped_get_pool_stats(self, *args, **kwargs):
-            """Fix negative token counts that occur in simulation mode."""
+            """Fix token accounting errors in simulation mode."""
             pool_stats = original_get_pool_stats(self, *args, **kwargs)
 
-            # Fix negative full_num_used and full_token_usage
-            if pool_stats.full_num_used < 0:
+            # Core fix: available + evictable must not exceed pool capacity.
+            # This is a physical invariant: the pool has max_total_num_tokens
+            # slots, and (available + evictable + used_by_running) = total.
+            # If available + evictable > total, the scheduler would admit
+            # too many requests (inflated rem_total_tokens).
+            max_total = self.max_total_num_tokens
+            available = pool_stats.full_available_size
+            evictable = pool_stats.full_evictable_size
+            total_free = available + evictable
+
+            if total_free > max_total:
+                # Scale down proportionally to preserve the ratio
+                # available : evictable, then clamp each individually
+                scale = max_total / total_free
+                clamped_available = int(available * scale)
+                clamped_evictable = max_total - clamped_available
+
                 logger.debug(
-                    f"Fixing negative full_num_used: {pool_stats.full_num_used} -> 0 "
-                    f"(available={pool_stats.full_available_size}, "
-                    f"evictable={pool_stats.full_evictable_size})"
+                    f"Clamping pool stats: available={available}->{clamped_available}, "
+                    f"evictable={evictable}->{clamped_evictable} "
+                    f"(total_free={total_free} > max_total={max_total})"
                 )
-                pool_stats.full_num_used = 0
-                pool_stats.full_token_usage = 0.0
+
+                pool_stats.full_available_size = clamped_available
+                pool_stats.full_evictable_size = clamped_evictable
+
+            # Recalculate num_used and token_usage from the (possibly clamped) values
+            num_used = max_total - (pool_stats.full_available_size + pool_stats.full_evictable_size)
+            pool_stats.full_num_used = max(num_used, 0)
+            pool_stats.full_token_usage = pool_stats.full_num_used / max_total if max_total > 0 else 0.0
 
             # Fix negative swa values
             if pool_stats.swa_num_used is not None and pool_stats.swa_num_used < 0:

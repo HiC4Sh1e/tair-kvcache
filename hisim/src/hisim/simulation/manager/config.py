@@ -168,11 +168,13 @@ class ConfigManager:
             mem_fraction_static = 0.9
             logger.info(f"Using default mem_fraction_static: {mem_fraction_static}")
 
-        # Fix: Check if the current mem_fraction_static provides sufficient capacity
-        # If SGLang set a very low value (like 0.1) due to large chunked_prefill_size,
-        # we need to override it for HiSim simulation to ensure sufficient token capacity
+        # Check if the current mem_fraction_static provides sufficient capacity.
+        # All KV cache for running requests must be in HBM during inference,
+        # so mem_fraction_static must provide enough capacity.
+        # When SGLang auto-calculates a bad value (e.g., -2.123) due to large
+        # chunked_prefill_size, we override to 0.9.
         need_capacity_override = False
-        if mem_fraction_static < 0.5:  # If less than 50%, it might be too small for large requests
+        if mem_fraction_static < 0.5:
             # Calculate expected capacity with current mem_fraction_static
             try:
                 from hisim.simulation.utils import estimate_kv_cache_pool_capacity

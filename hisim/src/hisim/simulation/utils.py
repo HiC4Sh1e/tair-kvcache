@@ -164,13 +164,13 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "total_throughput": (total_input + total_output) / total_dur_s,
         "prefix_cache_reused_ratio": 0
         if total_input == 0
-        else total_reused_tokens / total_input,
+        else total_reused_tokens / total_input,  # L1: total cache hit (HBM + Memory + Disk)
         "memory_prefetch_ratio": 0
         if total_input == 0
-        else total_memory_hit_tokens / total_input,
+        else total_memory_hit_tokens / total_input,  # L2: Memory + Disk cache hit
         "disk_prefetch_ratio": 0
         if total_input == 0
-        else total_disk_hit_tokens / total_input,
+        else total_disk_hit_tokens / total_input,  # L3: Disk only cache hit
         "mean_ttft_ms": np.mean(ttfts or 0) * 1000,
         "median_ttft_ms": np.median(ttfts or 0) * 1000,
         "std_ttft_ms": np.std(ttfts or 0) * 1000,
