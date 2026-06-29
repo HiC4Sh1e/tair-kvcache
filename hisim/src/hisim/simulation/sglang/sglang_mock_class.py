@@ -1081,19 +1081,31 @@ class MockHiCacheStorage:
             self.storage_file_path: str = "/tmp/hisim/hicache/storage_keys.txt"
             os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
 
-            if os.path.exists(self.storage_file_path):
-                with open(self.storage_file_path) as f:
-                    line = f.readline()
-                    while line:
-                        self.storage.add(line.strip())
+            # Default: clear storage at startup to avoid cross-run contamination.
+            # Previous runs' storage keys would cause the first request of a new
+            # run to have artificially high disk (L3) cache hits, because
+            # _storage_hit_query would match against stale keys.
+            # Set HISIM_PERSIST_HICACHE_STORAGE=1 to keep old keys (for warmup simulation).
+            persist = os.getenv("HISIM_PERSIST_HICACHE_STORAGE") == "1"
+            if persist:
+                if os.path.exists(self.storage_file_path):
+                    with open(self.storage_file_path) as f:
                         line = f.readline()
-
-        if Envs.reset_hicache_storage():
-            logger.info(
-                "Cleared KV cache saved in the storage backend because the system environment variable (`HISIM_RESET_HICACHE_STORAGE`) is set."
-            )
-            with open(self.storage_file_path, "w") as f:
-                pass
+                        while line:
+                            self.storage.add(line.strip())
+                            line = f.readline()
+                    logger.info(
+                        f"Loaded {len(self.storage)} storage keys from {self.storage_file_path} "
+                        f"(HISIM_PERSIST_HICACHE_STORAGE=1)."
+                    )
+            else:
+                # Clear the file to start with a clean slate
+                with open(self.storage_file_path, "w") as f:
+                    pass
+                logger.info(
+                    "Storage backend starts clean. "
+                    "Set HISIM_PERSIST_HICACHE_STORAGE=1 to load keys from previous runs."
+                )
 
     def init_kvcm(self):
         # Initialize kvcm based on reference examples

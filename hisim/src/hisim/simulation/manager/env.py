@@ -40,3 +40,14 @@ class Envs:
     @classmethod
     def reset_hicache_storage(cls) -> bool:
         return os.getenv("HISIM_RESET_HICACHE_STORAGE") == "1"
+
+    @classmethod
+    def persist_hicache_storage(cls) -> bool:
+        """Whether to load storage keys from previous runs (default: False).
+
+        When False (default), the disk cache starts clean each run.
+        When True, keys from previous runs are loaded from the persistence file,
+        which can simulate warm-start scenarios but may inflate L3 hit rates
+        if the previous run used different data.
+        """
+        return os.getenv("HISIM_PERSIST_HICACHE_STORAGE") == "1"
