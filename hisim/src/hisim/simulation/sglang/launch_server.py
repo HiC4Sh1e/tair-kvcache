@@ -121,6 +121,10 @@ if __name__ == "__main__":
             setattr(server_args, "hicache_storage_prefetch_policy", hicache_storage_prefetch_policy)
             logger.info(f"Applied hicache_storage_prefetch_policy from config: {hicache_storage_prefetch_policy}")
 
+    # Limit prefill batch size to 1 for per-request cache hit analysis
+    setattr(server_args, "prefill_max_requests", 1)
+    logger.info("Set prefill_max_requests=1 for per-request cache hit analysis")
+
     # Auto-register model and hardware from config if using inference_predictor
     if config_path and os.path.exists(config_path):
         with open(config_path) as f:

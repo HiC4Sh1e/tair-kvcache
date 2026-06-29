@@ -1507,6 +1507,8 @@ class C_SchedulerHook(BaseHook):
                     #   L2 (Memory) = host + storage           = hierarchical cache contribution
                     #   L3 (Disk)   = storage                  = disk cache contribution
                     # So L3 ⊂ L2 ⊂ L1, and no double-counting is possible.
+                    # Compute per-level cache breakdown
+                    input_len = req_stats.input_length
                     if hasattr(req, 'cached_tokens_device'):
                         device_portion = req.cached_tokens_device
                         host_portion = getattr(req, 'cached_tokens_host', 0)
@@ -1515,15 +1517,67 @@ class C_SchedulerHook(BaseHook):
                         # prefetch completed, use the prefetch value
                         if storage_portion == 0 and req_stats.prefetch_complete_tokens > 0:
                             storage_portion = req_stats.prefetch_complete_tokens
+
+                        # Raw SGLang values for diagnostics
+                        raw_device = device_portion
+                        raw_host = host_portion
+                        raw_storage = storage_portion
+                        raw_total = raw_device + raw_host + raw_storage
+
+                        # Total reused tokens across all cache levels
+                        total_cached = raw_total
+
+                        # Clamp: total_cached must not exceed input_length.
+                        # In simulation, schedule_batch.py may compute breakdown
+                        # values that exceed input_length due to:
+                        # - Page alignment padding in host_hit_length / prefix_indices
+                        # - Timing differences: host_hit_length is computed before
+                        #   init_load_back, but prefix_indices includes loaded-back tokens
+                        # - storage_hit_length from prefetch may overlap with host data
+                        # Without clamping, aggregate hit rate exceeds 100%.
+                        if total_cached > input_len and input_len > 0:
+                            scale = input_len / total_cached
+                            device_portion = int(device_portion * scale)
+                            host_portion = int(host_portion * scale)
+                            storage_portion = input_len - device_portion - host_portion
+                            total_cached = input_len
+                            logger.debug(
+                                f"Clamping cache breakdown for req {req.rid}: "
+                                f"raw_total={raw_total} -> {input_len} "
+                                f"(raw: dev={raw_device} host={raw_host} storage={raw_storage})"
+                            )
+
                         # L1 = total cache hit (all levels)
-                        req_stats.final_reused_tokens = device_portion + host_portion + storage_portion
+                        req_stats.final_reused_tokens = total_cached
                         # L2 = hierarchical cache hit (L2 + L3)
                         req_stats.memory_hit_tokens = host_portion + storage_portion
                         # L3 = disk cache hit only
                         req_stats.prefetch_complete_tokens = storage_portion
+
+                        # Detailed per-request prefill logging
+                        miss_len = max(0, input_len - total_cached)
+                        prefix_len = len(req.prefix_indices) if hasattr(req, 'prefix_indices') else 0
+                        host_hit = getattr(req, 'host_hit_length', 0)
+                        storage_hit = getattr(req, 'storage_hit_length', 0)
+                        hit_pct = f"({total_cached / input_len:.1%} hit)" if input_len > 0 else ""
+                        logger.info(
+                            f"[Prefill] req={req.rid} input={input_len} "
+                            f"L1(HBM)={device_portion} L2(Mem)={host_portion} "
+                            f"L3(Disk)={storage_portion} miss={miss_len} "
+                            f"cached_total={total_cached} {hit_pct} "
+                            f"[raw: prefix_idx={prefix_len} host_hit={host_hit} "
+                            f"storage_hit={storage_hit} "
+                            f"dev={raw_device} host={raw_host} disk={raw_storage}]"
+                        )
                     else:
                         # No HiCache — all cached tokens are L1 (HBM only)
-                        req_stats.final_reused_tokens = req.cached_tokens
+                        req_stats.final_reused_tokens = min(req.cached_tokens, input_len)
+                        miss_len = max(0, input_len - req.cached_tokens)
+                        logger.info(
+                            f"[Prefill] req={req.rid} input={input_len} "
+                            f"L1(HBM)={req.cached_tokens} miss={miss_len} "
+                            f"cached_total={req.cached_tokens}"
+                        )
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                             req_stats.queue_end = now
