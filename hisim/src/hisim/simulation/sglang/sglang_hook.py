@@ -935,36 +935,9 @@ class C_HiRadixCacheHook(BaseHook):
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
             return original_check_hicache_events(self, *args, **kwargs)
 
-        original_evictable_size = target.evictable_size
-
-        def wrapped_evictable_size(self):
-            """Clamp evictable_size to ensure available + evictable <= max_total_num_tokens.
-
-            In simulation, evictable_size_ can be double-counted when
-            load_back() and dec_lock_ref() both increment it for the same nodes.
-            This inflates the scheduler's rem_total_tokens, allowing more
-            requests than HBM can hold.
-            """
-            raw_evictable = original_evictable_size(self)
-            # available_size is already capped by MockBaseTokenToKVPoolAllocator
-            available = self.token_to_kv_pool_allocator.available_size()
-            # token_to_kv_pool_allocator.size = max_total_num_tokens
-            max_total = self.token_to_kv_pool_allocator.size
-            max_evictable = max_total - available
-            if max_evictable < 0:
-                max_evictable = 0
-            if raw_evictable > max_evictable:
-                logger.debug(
-                    f"Clamping evictable_size: {raw_evictable} -> {max_evictable} "
-                    f"(available={available}, max_total={max_total})"
-                )
-                return max_evictable
-            return raw_evictable
-
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
-        target.evictable_size = wrapped_evictable_size
         return target
 
 

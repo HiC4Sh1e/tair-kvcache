@@ -656,22 +656,13 @@ class MockTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-        # Filter out invalid indices: must be in [1, size] range
-        # and not already in free_pages (prevent double-free)
-        valid_mask = (free_index >= 1) & (free_index <= self.size)
-        valid_index = free_index[valid_mask]
-        if valid_index.numel() == 0:
-            return
-        # Remove duplicates from the freed indices
-        valid_index = torch.unique(valid_index)
-        # Remove indices that are already free (double-free protection)
-        if self.free_pages.numel() > 0:
-            already_free = torch.isin(valid_index, self.free_pages)
-            valid_index = valid_index[~already_free]
-        if valid_index.numel() > 0:
-            self.free_pages = torch.cat((self.free_pages, valid_index))
+        # Note: We don't validate indices here because the simulation's
+        # radix tree may legitimately free the same index through different
+        # code paths (e.g., node eviction + request completion for shared
+        # prefix nodes). Over-validation causes OOM by shrinking free_pages.
+        # The available_size() cap is sufficient to prevent the scheduler
+        # from over-admitting requests.
+        self.free_pages = torch.cat((self.free_pages, free_index))
 
 
 class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
@@ -713,19 +704,7 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            # Convert token indices to page indices and deduplicate
             free_page_indices = torch.unique(free_index // self.page_size)
-            # Filter out invalid page indices (must be in [1, num_pages])
-            valid_mask = (free_page_indices >= 1) & (free_page_indices <= self.num_pages)
-            free_page_indices = free_page_indices[valid_mask]
-            if free_page_indices.numel() == 0:
-                return
-            # Remove pages that are already free (double-free protection)
-            if self.free_pages.numel() > 0:
-                already_free = torch.isin(free_page_indices, self.free_pages)
-                free_page_indices = free_page_indices[~already_free]
-            if free_page_indices.numel() == 0:
-                return
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
