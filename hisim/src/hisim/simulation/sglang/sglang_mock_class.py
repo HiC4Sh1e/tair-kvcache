@@ -862,9 +862,17 @@ class MockTokenToKVPoolHost:
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert self.size > device_pool.size, (
-            "The host memory should be larger than the device memory with the current protocol"
-        )
+        # In simulation, allow host pool to be smaller than device pool.
+        # This is useful for testing eviction pressure (low hicache_ratio).
+        # In real production, host > device is required for proper hierarchical
+        # cache operation, but simulation doesn't use real GPU memory.
+        if self.size <= device_pool.size:
+            logger.warning(
+                f"Host memory pool ({self.size} tokens) is not larger than "
+                f"device pool ({device_pool.size} tokens). In simulation this is "
+                f"allowed but will cause aggressive host eviction and potential "
+                f"data loss from the radix tree."
+            )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()

@@ -764,11 +764,85 @@ class C_HiRadixCacheHook(BaseHook):
     def hook(cls, target):
         original_check_hicache_events = target.check_hicache_events
         original_reset = target.reset
+        original_evict = target.evict
 
         def wrapped_reset(self):
             if hasattr(self, "cache_controller"):
                 self.cache_controller.handle_backup_operation()
             original_reset(self)
+
+        def wrapped_evict(self, params):
+            """Override eviction to add a fallback when write_backup fails.
+
+            In HiRadixCache with write_back policy, when HBM eviction happens:
+            1. write_backup() tries to write node data to Host
+            2. If Host is full, evict_host() is called to make room
+            3. If evict_host() still can't make room, write_backup() returns 0
+            4. The node stays in HBM and eviction can't proceed
+
+            The problem: in simulation, Host pool may be intentionally small
+            (hicache_ratio < 1.0) to create eviction pressure. But
+            write_backup failure means HBM can't be freed, causing either OOM
+            or no eviction at all. Meanwhile, the node stays in the tree
+            (node.value = None for evicted nodes), so _match_prefix_helper
+            still matches past it, keeping L1 hit rate high.
+
+            Solution: when write_backup fails for a node (Host full), fall
+            back to _evict_regular() which truly removes the node from the
+            tree (parent.children.pop). This breaks the prefix chain, so
+            future requests can't match that prefix → L1 hit rate drops.
+            """
+            result = original_evict(self, params)
+
+            # If eviction didn't free enough tokens, do a second pass
+            # using _evict_regular (which removes nodes from the tree).
+            num_still_need = params.num_tokens - result.num_tokens_evicted
+            if num_still_need > 0:
+                # Second pass: evict nodes that couldn't be backed up to host
+                # by forcefully removing them from the tree.
+                leaves = list(self.evictable_leaves)
+                if not leaves:
+                    return result
+
+                eviction_heap = [
+                    (self.eviction_strategy.get_priority(node), node)
+                    for node in leaves
+                ]
+                heapq.heapify(eviction_heap)
+
+                num_force_evicted = 0
+                while num_force_evicted < num_still_need and len(eviction_heap):
+                    _priority, x = heapq.heappop(eviction_heap)
+
+                    if x.lock_ref > 0:
+                        continue
+                    # Skip nodes already evicted from HBM (value=None)
+                    if x.evicted:
+                        continue
+                    if x.backuped:
+                        # Already backed up, use normal _evict_backuped
+                        num_force_evicted += self._evict_backuped(x)
+                    else:
+                        # Not backed up — write_backup failed. Force-remove from tree.
+                        # This is the key change: instead of keeping the node
+                        # in HBM, we delete it from the tree entirely.
+                        num_force_evicted += self._evict_regular(x)
+
+                    # Check parent for eviction eligibility
+                    if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+                        new_priority = self.eviction_strategy.get_priority(x.parent)
+                        heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+                if num_force_evicted > 0:
+                    logger.debug(
+                        f"Force-evicted {num_force_evicted} tokens from tree "
+                        f"(original_evict freed {result.num_tokens_evicted}, "
+                        f"needed {params.num_tokens})"
+                    )
+                    total_evicted = result.num_tokens_evicted + num_force_evicted
+                    return type(result)(num_tokens_evicted=total_evicted)
+
+            return result
 
         def override_init(self, params, server_args):
             if server_args.hicache_io_backend == "direct":
@@ -938,6 +1012,7 @@ class C_HiRadixCacheHook(BaseHook):
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
+        target.evict = wrapped_evict
         return target
 
 
