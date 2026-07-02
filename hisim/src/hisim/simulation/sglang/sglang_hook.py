@@ -765,6 +765,7 @@ class C_HiRadixCacheHook(BaseHook):
         original_check_hicache_events = target.check_hicache_events
         original_reset = target.reset
         original_evict = target.evict
+        original_match_prefix_helper = target._match_prefix_helper
 
         def wrapped_reset(self):
             if hasattr(self, "cache_controller"):
@@ -783,14 +784,15 @@ class C_HiRadixCacheHook(BaseHook):
             The problem: in simulation, Host pool may be intentionally small
             (hicache_ratio < 1.0) to create eviction pressure. But
             write_backup failure means HBM can't be freed, causing either OOM
-            or no eviction at all. Meanwhile, the node stays in the tree
-            (node.value = None for evicted nodes), so _match_prefix_helper
-            still matches past it, keeping L1 hit rate high.
+            or no eviction at all.
 
-            Solution: when write_backup fails for a node (Host full), fall
-            back to _evict_regular() which truly removes the node from the
-            tree (parent.children.pop). This breaks the prefix chain, so
-            future requests can't match that prefix → L1 hit rate drops.
+            Note: wrapped_match_prefix_helper now stops prefix matching at
+            evicted nodes, so nodes evicted via _evict_backuped (which stay
+            in the tree) are no longer matched past. This hook handles the
+            remaining case where write_backup fails entirely — the node is
+            NOT backed up, stays in HBM (value != None, evicted = False),
+            and would still be matched by _match_prefix_helper. We use
+            _evict_regular to force-remove such nodes from the tree.
             """
             result = original_evict(self, params)
 
@@ -843,6 +845,66 @@ class C_HiRadixCacheHook(BaseHook):
                     return type(result)(num_tokens_evicted=total_evicted)
 
             return result
+
+        def wrapped_match_prefix_helper(self, node, key):
+            """Modified _match_prefix_helper that STOPS at evicted nodes.
+
+            In the original HiRadixCache, _match_prefix_helper continues
+            walking past evicted nodes (node = child even when child.evicted).
+            This means the prefix match extends through eviction boundaries,
+            and nodes deeper in the tree (past evicted ancestors) are still
+            discoverable even though their parent was evicted from HBM.
+
+            The user's requirement: when HBM tokens are reallocated (eviction),
+            the corresponding hash must be removed from the HBM radix tree.
+            Future requests should NOT be able to match past the eviction
+            boundary from the device perspective. The evicted node can only
+            be hit in Host (via load_back) or Disk.
+
+            Implementation: when we encounter an evicted child during the
+            tree walk, we set node = child (to preserve last_node for
+            host_hit_length calculation in match_prefix) and then break
+            the walk. This ensures:
+            - value only contains non-evicted (HBM) values
+            - last_node is the evicted node at the boundary
+            - match_prefix's walk-up logic correctly computes host_hit_length
+            - Deeper nodes (children of evicted nodes) are NOT discovered
+            """
+            import time as _time
+            node.last_access_time = _time.monotonic()
+            child_key = key.child_key(self.page_size)
+            value = []
+
+            while len(key) > 0 and child_key in node.children.keys():
+                child = node.children[child_key]
+                child.last_access_time = _time.monotonic()
+                prefix_len = child.key.match(key, page_size=self.page_size)
+                if prefix_len < len(child.key):
+                    new_node = self._split_node(child.key, child, prefix_len)
+                    if not new_node.evicted:
+                        value.append(new_node.value)
+                    node = new_node
+                    break
+                else:
+                    if not child.evicted:
+                        value.append(child.value)
+                        node = child
+                        key = key[prefix_len:]
+                        if len(key):
+                            child_key = key.child_key(self.page_size)
+                    else:
+                        # STOP at eviction boundary: set node to the evicted
+                        # child so match_prefix can compute host_hit_length,
+                        # then break — do NOT continue past evicted nodes.
+                        node = child
+                        logger.debug(
+                            f"[MatchPrefix] Stopped at evicted boundary: "
+                            f"node_id={child.id} key_len={len(child.key)} "
+                            f"backuped={child.backuped}"
+                        )
+                        break
+
+            return value, node
 
         def override_init(self, params, server_args):
             if server_args.hicache_io_backend == "direct":
@@ -1013,6 +1075,7 @@ class C_HiRadixCacheHook(BaseHook):
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
         target.evict = wrapped_evict
+        target._match_prefix_helper = wrapped_match_prefix_helper
         return target
 
 
@@ -1378,26 +1441,19 @@ class C_SchedulerHook(BaseHook):
             # This happens when chunked_prefill_size is too large (e.g., 196K), causing
             # SGLang's automatic calculation (gpu_mem - reserved_mem) / gpu_mem to produce
             # negative values or very small positive values.
-            # All KV cache for running requests must be in HBM during inference,
-            # so we must ensure mem_fraction_static provides sufficient capacity.
+            # Only override truly invalid values (None or <= 0), NOT user-specified
+            # low values (0 < value < 0.5). Low values are intentionally set to
+            # create eviction pressure for cache hit rate testing.
             if hasattr(self, 'server_args') and hasattr(self.server_args, 'mem_fraction_static'):
                 original_fraction = self.server_args.mem_fraction_static
 
-                # Check for invalid or insufficient mem_fraction_static
-                # Invalid: None or <= 0
-                # Insufficient: < 0.5 (may not provide enough capacity for large requests)
-                if original_fraction is None or original_fraction <= 0 or original_fraction < 0.5:
-                    # SGLang's automatic calculation failed or produced insufficient value
-                    corrected_fraction = 0.9  # 90% HBM for KV cache
+                if original_fraction is None or original_fraction <= 0:
+                    # SGLang's automatic calculation failed — override to safe default
+                    corrected_fraction = 0.9
                     self.server_args.mem_fraction_static = corrected_fraction
 
-                    if original_fraction is None or original_fraction <= 0:
-                        reason = f"invalid ({original_fraction})."
-                    else:
-                        reason = f"too small ({original_fraction}). May cause insufficient capacity for large requests."
-
                     logger.warning(
-                        f"Detected mem_fraction_static {reason} "
+                        f"Detected mem_fraction_static invalid ({original_fraction}). "
                         f"This is likely caused by chunked_prefill_size being too large for GPU memory. "
                         f"Corrected to {corrected_fraction} for HiSim simulation."
                     )
@@ -1410,6 +1466,13 @@ class C_SchedulerHook(BaseHook):
                     )
                     sched_config.mem_fraction_static = corrected_fraction
                     ConfigManager.set_scheduler_config(sched_config)
+                elif original_fraction < 0.5:
+                    # User intentionally set a low value — warn but don't override
+                    logger.warning(
+                        f"mem_fraction_static={original_fraction} is low. "
+                        f"HBM capacity may be insufficient for large concurrent requests, "
+                        f"causing aggressive eviction. This is expected for cache hit rate testing."
+                    )
 
             logger.info("=" * 60)
             logger.info("HiSim KVCache Hierarchy Configuration:")
@@ -1577,11 +1640,16 @@ class C_SchedulerHook(BaseHook):
                     # SGLang provides cached_tokens_device (L1/HBM),
                     # cached_tokens_host (L2/Memory), cached_tokens_storage (L3/Disk).
                     #
-                    # Cache hit rate semantics (all KV must be in HBM during inference):
-                    #   L1 (HBM)   = device + host + storage  = total cache hit rate
-                    #   L2 (Memory) = host + storage           = hierarchical cache contribution
-                    #   L3 (Disk)   = storage                  = disk cache contribution
-                    # So L3 ⊂ L2 ⊂ L1, and no double-counting is possible.
+                    # Cache hit rate semantics (mutually exclusive, L1 bounded by HBM capacity):
+                    #   L1 (HBM)   = device tokens only = tokens that were already in HBM
+                    #   L2 (Memory) = host tokens only  = tokens loaded from host (needed load_back)
+                    #   L3 (Disk)   = storage tokens   = tokens loaded from disk (needed prefetch)
+                    #   Total       = L1 + L2 + L3    = total cache hit rate
+                    #
+                    # Key constraint: L1 cache size must not exceed max_total_num_tokens
+                    # (the HBM KV cache pool size). When tokens are evicted from HBM
+                    # (reallocated to new requests), the corresponding cache entries
+                    # are no longer in L1 — they become L2 (host) or are removed.
                     # Compute per-level cache breakdown
                     input_len = req_stats.input_length
                     if hasattr(req, 'cached_tokens_device'):
@@ -1600,16 +1668,11 @@ class C_SchedulerHook(BaseHook):
                         raw_total = raw_device + raw_host + raw_storage
 
                         # Total reused tokens across all cache levels
-                        total_cached = raw_total
+                        total_cached = device_portion + host_portion + storage_portion
 
-                        # Clamp: total_cached must not exceed input_length.
-                        # In simulation, schedule_batch.py may compute breakdown
-                        # values that exceed input_length due to:
-                        # - Page alignment padding in host_hit_length / prefix_indices
-                        # - Timing differences: host_hit_length is computed before
-                        #   init_load_back, but prefix_indices includes loaded-back tokens
-                        # - storage_hit_length from prefetch may overlap with host data
-                        # Without clamping, aggregate hit rate exceeds 100%.
+                        # Safety clamp: total_cached must not exceed input_length.
+                        # In most cases device+host+storage <= input_length,
+                        # but page alignment or timing issues can inflate values.
                         if total_cached > input_len and input_len > 0:
                             scale = input_len / total_cached
                             device_portion = int(device_portion * scale)
@@ -1622,24 +1685,27 @@ class C_SchedulerHook(BaseHook):
                                 f"(raw: dev={raw_device} host={raw_host} storage={raw_storage})"
                             )
 
-                        # L1 = total cache hit (all levels)
-                        req_stats.final_reused_tokens = total_cached
-                        # L2 = hierarchical cache hit (L2 + L3)
-                        req_stats.memory_hit_tokens = host_portion + storage_portion
-                        # L3 = disk cache hit only
+                        # Mutually exclusive breakdown:
+                        # L1 = device only (tokens that were in HBM, no load_back needed)
+                        # L2 = host only (tokens that needed load_back from host)
+                        # L3 = storage only (tokens loaded from disk)
+                        # Total = L1 + L2 + L3 = overall cache hit rate
+                        req_stats.final_reused_tokens = device_portion
+                        req_stats.memory_hit_tokens = host_portion
                         req_stats.prefetch_complete_tokens = storage_portion
 
                         # Detailed per-request prefill logging
-                        miss_len = max(0, input_len - total_cached)
+                        total_hit = device_portion + host_portion + storage_portion
+                        miss_len = max(0, input_len - total_hit)
                         prefix_len = len(req.prefix_indices) if hasattr(req, 'prefix_indices') else 0
                         host_hit = getattr(req, 'host_hit_length', 0)
                         storage_hit = getattr(req, 'storage_hit_length', 0)
-                        hit_pct = f"({total_cached / input_len:.1%} hit)" if input_len > 0 else ""
+                        hit_pct = f"({total_hit / input_len:.1%} hit)" if input_len > 0 else ""
                         logger.info(
                             f"[Prefill] req={req.rid} input={input_len} "
                             f"L1(HBM)={device_portion} L2(Mem)={host_portion} "
                             f"L3(Disk)={storage_portion} miss={miss_len} "
-                            f"cached_total={total_cached} {hit_pct} "
+                            f"cached_total={total_hit} {hit_pct} "
                             f"[raw: prefix_idx={prefix_len} host_hit={host_hit} "
                             f"storage_hit={storage_hit} "
                             f"dev={raw_device} host={raw_host} disk={raw_storage}]"

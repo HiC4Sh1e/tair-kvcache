@@ -2552,8 +2552,10 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("{s:{c}^{n}}".format(s="KVCache Hit Statistics", n=50, c="-"))
-    print("{:<40} {:<10.2%}".format("L1 (Total) cache hit rate:", metrics.prefix_cache_reused_ratio))
-    print("{:<40} {:<10.2%}".format("L2 (Memory+Disk) cache hit rate:", metrics.memory_prefetch_ratio))
+    total_hit_rate = metrics.prefix_cache_reused_ratio + metrics.memory_prefetch_ratio + metrics.disk_prefetch_ratio
+    print("{:<40} {:<10.2%}".format("Total cache hit rate:", total_hit_rate))
+    print("{:<40} {:<10.2%}".format("L1 (HBM) cache hit rate:", metrics.prefix_cache_reused_ratio))
+    print("{:<40} {:<10.2%}".format("L2 (Memory) cache hit rate:", metrics.memory_prefetch_ratio))
     print("{:<40} {:<10.2%}".format("L3 (Disk) cache hit rate:", metrics.disk_prefetch_ratio))
     print("=" * 50)
 

@@ -212,19 +212,25 @@ class ConfigManager:
             except Exception as e:
                 logger.warning(f"Could not estimate capacity: {e}. Using fallback logic.")
 
-        # Apply override if needed based on simple heuristic (calculation failed or insufficient capacity)
-        if need_capacity_override or mem_fraction_static < 0.5:
+        # Apply override only if capacity is truly insufficient.
+        # Previously, any mem_fraction_static < 0.5 was overridden to 0.9, which
+        # prevented users from creating eviction pressure for cache hit rate testing.
+        # Now we only override when SGLang's auto-calculation produced an invalid
+        # value (capacity < min_required_tokens), not when the user intentionally
+        # set a low value.
+        if need_capacity_override:
             override_fraction = 0.9
             mem_fraction_static = override_fraction
-            if need_capacity_override:
-                logger.info(f"Overridden mem_fraction_static to {override_fraction} for sufficient capacity")
-            else:
-                logger.warning(
-                    f"mem_fraction_static={mem_fraction_static} seems too low. "
-                    f"If SGLang calculated this based on large chunked_prefill_size, "
-                    f"overriding to {override_fraction} for HiSim simulation."
-                )
-                mem_fraction_static = override_fraction
+            logger.info(f"Overridden mem_fraction_static to {override_fraction} for sufficient capacity")
+        elif mem_fraction_static < 0.5:
+            # User intentionally set a low value — warn but don't override.
+            # This is useful for testing cache eviction pressure.
+            logger.warning(
+                f"mem_fraction_static={mem_fraction_static} is low. "
+                f"HBM capacity may be insufficient for large concurrent requests, "
+                f"causing aggressive eviction and potential OOM. "
+                f"If this is unintentional (SGLang auto-calculated), set it explicitly."
+            )
         dtype = scheduler_config.get("data_type")
         if dtype is not None:
             dtype = DataType(dtype.upper())
