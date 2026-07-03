@@ -1449,7 +1449,6 @@ class C_SchedulerHook(BaseHook):
                 if original_fraction is None or original_fraction <= 0:
                     # SGLang's automatic calculation produced an invalid value.
                     # Use the value from HiSim config file instead of hardcoding 0.9.
-                    import json
                     from hisim.simulation.manager.env import Envs
                     try:
                         with open(Envs.config_path()) as f:
