@@ -860,11 +860,23 @@ class C_HiRadixCacheHook(BaseHook):
                         if x.evicted:
                             continue
                         if x.backuped:
+                            # Already backed up to Host, use _evict_backuped
+                            # which keeps the node in the tree (host_value intact)
                             num_force_evicted += self._evict_backuped(x)
-                        else:
+                        elif len(x.children) == 0:
+                            # Not backed up AND is a leaf node.
                             # write_backup failed — Host pool likely full.
                             # Force-remove from tree to free HBM tokens.
                             num_force_evicted += self._evict_regular(x)
+                        else:
+                            # Not backed up AND has children — cannot _evict_regular
+                            # (assertion: len(node.children) == 0).
+                            # This happens when children were evicted via
+                            # _evict_backuped (stay in tree) but parent
+                            # still has HBM value. Skip for now — the
+                            # children will eventually be removed by
+                            # evict_host, freeing the parent.
+                            continue
 
                         if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                             new_priority = self.eviction_strategy.get_priority(x.parent)
