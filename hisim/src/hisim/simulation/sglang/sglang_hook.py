@@ -765,6 +765,7 @@ class C_HiRadixCacheHook(BaseHook):
         original_check_hicache_events = target.check_hicache_events
         original_reset = target.reset
         original_evict = target.evict
+        original_evict_host = target.evict_host
         original_match_prefix_helper = target._match_prefix_helper
 
         def wrapped_reset(self):
@@ -804,6 +805,12 @@ class C_HiRadixCacheHook(BaseHook):
 
             num_evicted = 0
             write_back_nodes = []
+            # Diagnostic counters
+            _wb_success = 0     # write_backup succeeded (node stays in tree for L2)
+            _wb_fail = 0        # write_backup failed (host pool full)
+            _evict_backuped_count = 0  # _evict_backuped (already backed up, stays in tree)
+            _evict_regular_count = 0   # _evict_regular (removed from tree, no L2 possible)
+
             while num_evicted < params.num_tokens and len(eviction_heap):
                 _priority, x = heapq.heappop(eviction_heap)
 
@@ -815,12 +822,23 @@ class C_HiRadixCacheHook(BaseHook):
                     # In write_through mode, nodes that haven't been hit enough
                     # times may not have host_value yet. We write them now so
                     # they can be discovered as L2 hits later.
+                    _host_avail = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
+                    _node_value_len = len(x.value) if x.value is not None else 0
                     written = self.write_backup(x, write_back=True)
-                    num_evicted += written
                     if written > 0:
+                        num_evicted += written
                         write_back_nodes.append(x)
+                        _wb_success += 1
+                    else:
+                        _wb_fail += 1
+                        # write_backup failed (host pool full).
+                        logger.debug(
+                            f"[Evict] write_backup FAILED: node_id={x.id} "
+                            f"value_len={_node_value_len} host_avail={_host_avail}"
+                        )
                 else:
                     num_evicted += self._evict_backuped(x)
+                    _evict_backuped_count += 1
 
                 for child in x.parent.children.values():
                     if child in write_back_nodes:
@@ -863,11 +881,13 @@ class C_HiRadixCacheHook(BaseHook):
                             # Already backed up to Host, use _evict_backuped
                             # which keeps the node in the tree (host_value intact)
                             num_force_evicted += self._evict_backuped(x)
+                            _evict_backuped_count += 1
                         elif len(x.children) == 0:
                             # Not backed up AND is a leaf node.
                             # write_backup failed — Host pool likely full.
                             # Force-remove from tree to free HBM tokens.
                             num_force_evicted += self._evict_regular(x)
+                            _evict_regular_count += 1
                         else:
                             # Not backed up AND has children — cannot _evict_regular
                             # (assertion: len(node.children) == 0).
@@ -883,6 +903,16 @@ class C_HiRadixCacheHook(BaseHook):
                             heapq.heappush(eviction_heap, (new_priority, x.parent))
 
                     num_evicted += num_force_evicted
+
+            # Diagnostic: log eviction breakdown
+            host_available = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
+            logger.info(
+                f"[Evict] need={params.num_tokens} freed={num_evicted} "
+                f"wb_success={_wb_success} wb_fail={_wb_fail} "
+                f"evict_backuped={_evict_backuped_count} "
+                f"evict_regular={_evict_regular_count} "
+                f"host_pool_avail={host_available}"
+            )
 
             self.update_eviction_metrics(num_evicted, start_time)
             return EvictResult(num_tokens_evicted=num_evicted)
@@ -1100,11 +1130,35 @@ class C_HiRadixCacheHook(BaseHook):
             self.write_through_threshold = (
                 1 if server_args.hicache_write_policy == "write_through" else 2
             )
-            self.load_back_threshold = 10
+            self.load_back_threshold = 0  # Allow load_back for any size (simulation)
             # Version: 0.5.9
             self.evictable_host_leaves = set()
             # super().__init__(params=params)
             target.__mro__[1].__init__(self, params=params)
+
+        def wrapped_evict_host(self, num_tokens: int):
+            """Override evict_host to log when nodes are removed from the tree.
+
+            Original evict_host removes nodes from parent.children (parent.children.pop),
+            which makes them undiscoverable by match_prefix — no L2 hits possible.
+            """
+            _host_leaves_before = len(self.evictable_host_leaves)
+            _host_avail_before = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
+
+            # Call the original evict_host (saved before we override)
+            result = original_evict_host(self, num_tokens)
+
+            _host_leaves_after = len(self.evictable_host_leaves)
+            _host_avail_after = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
+            _removed = _host_leaves_before - _host_leaves_after
+
+            if _removed > 0:
+                logger.info(
+                    f"[EvictHost] removed ~{_removed} nodes from tree "
+                    f"(host_pool: {_host_avail_before} -> {_host_avail_after})"
+                )
+
+            return result
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
             # Call operation handler first.
@@ -1116,6 +1170,7 @@ class C_HiRadixCacheHook(BaseHook):
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
         target.evict = wrapped_evict
+        target.evict_host = wrapped_evict_host
         target._match_prefix_helper = wrapped_match_prefix_helper
         return target
 
