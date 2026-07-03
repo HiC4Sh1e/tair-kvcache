@@ -1438,25 +1438,40 @@ class C_SchedulerHook(BaseHook):
                 self.on_idle = wrapped_on_idle
 
             # Fix: Sanitize mem_fraction_static to prevent invalid memory configuration
-            # This happens when chunked_prefill_size is too large (e.g., 196K), causing
-            # SGLang's automatic calculation (gpu_mem - reserved_mem) / gpu_mem to produce
-            # negative values or very small positive values.
-            # Only override truly invalid values (None or <= 0), NOT user-specified
-            # low values (0 < value < 0.5). Low values are intentionally set to
-            # create eviction pressure for cache hit rate testing.
+            # SGLang's automatic calculation can produce invalid values (e.g., -2.123)
+            # when chunked_prefill_size is too large. When this happens, we should
+            # use the value from HiSim config instead of overriding to 0.9.
+            # This allows users to intentionally set a low mem_fraction_static
+            # (e.g., 0.2) to create eviction pressure for cache hit rate testing.
             if hasattr(self, 'server_args') and hasattr(self.server_args, 'mem_fraction_static'):
                 original_fraction = self.server_args.mem_fraction_static
 
                 if original_fraction is None or original_fraction <= 0:
-                    # SGLang's automatic calculation failed — override to safe default
-                    corrected_fraction = 0.9
-                    self.server_args.mem_fraction_static = corrected_fraction
+                    # SGLang's automatic calculation produced an invalid value.
+                    # Use the value from HiSim config file instead of hardcoding 0.9.
+                    import json
+                    from hisim.simulation.manager.env import Envs
+                    try:
+                        with open(Envs.config_path()) as f:
+                            hisim_config = json.load(f)
+                        config_fraction = hisim_config.get("scheduler", {}).get("mem_fraction_static")
+                    except Exception:
+                        config_fraction = None
 
-                    logger.warning(
-                        f"Detected mem_fraction_static invalid ({original_fraction}). "
-                        f"This is likely caused by chunked_prefill_size being too large for GPU memory. "
-                        f"Corrected to {corrected_fraction} for HiSim simulation."
-                    )
+                    if config_fraction is not None and config_fraction > 0:
+                        corrected_fraction = max(0.01, min(0.95, config_fraction))
+                        logger.info(
+                            f"Detected mem_fraction_static invalid ({original_fraction}) from SGLang. "
+                            f"Using config value {config_fraction} (clamped to {corrected_fraction})."
+                        )
+                    else:
+                        corrected_fraction = 0.9
+                        logger.warning(
+                            f"Detected mem_fraction_static invalid ({original_fraction}) and "
+                            f"no config override. Using default {corrected_fraction}."
+                        )
+
+                    self.server_args.mem_fraction_static = corrected_fraction
 
                     # Update our internal scheduler config to use the corrected value
                     sched_config = ConfigManager.get_scheduler_config(
@@ -1468,10 +1483,10 @@ class C_SchedulerHook(BaseHook):
                     ConfigManager.set_scheduler_config(sched_config)
                 elif original_fraction < 0.5:
                     # User intentionally set a low value — warn but don't override
-                    logger.warning(
+                    logger.info(
                         f"mem_fraction_static={original_fraction} is low. "
-                        f"HBM capacity may be insufficient for large concurrent requests, "
-                        f"causing aggressive eviction. This is expected for cache hit rate testing."
+                        f"HBM capacity will be limited, causing aggressive eviction. "
+                        f"This is expected for cache hit rate testing."
                     )
 
             logger.info("=" * 60)

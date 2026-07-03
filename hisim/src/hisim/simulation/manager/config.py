@@ -150,86 +150,60 @@ class ConfigManager:
             dp_size = internal_config.dp_size
 
         # Fix: Handle mem_fraction_static default value
-        # If not set in config, use reasonable default based on hardware
+        # In HiSim simulation, mem_fraction_static controls the simulated HBM pool
+        # size for KV cache. Users may intentionally set a LOW value (e.g., 0.2)
+        # to create eviction pressure for cache hit rate testing. We must NOT
+        # override user-specified values with capacity-based constraints.
+        #
+        # The previous logic had a min_required_tokens=196000 check that forced
+        # mem_fraction_static to 0.9 when estimated capacity was below 196K.
+        # This was wrong for simulation — we don't need to actually fit all tokens
+        # in HBM; the simulation correctly handles eviction when capacity is small.
         internal_mem_fraction = internal_config.mem_fraction_static
         config_mem_fraction = scheduler_config.get("mem_fraction_static")
 
-        # Determine target requirements: need at least 196K tokens for large requests
-        min_required_tokens = 196000  # Minimum required for 196K chunked prefill
-
         if config_mem_fraction is not None:
-            mem_fraction_static = max(0.1, min(0.95, config_mem_fraction))  # Clamp to reasonable range
+            # User explicitly set in config — use it directly, only clamp to [0.01, 0.95]
+            mem_fraction_static = max(0.01, min(0.95, config_mem_fraction))
             logger.info(f"Using mem_fraction_static from config: {mem_fraction_static}")
-        elif internal_mem_fraction is not None:
-            mem_fraction_static = max(0.1, min(0.95, internal_mem_fraction))  # Clamp to reasonable range
+        elif internal_mem_fraction is not None and internal_mem_fraction > 0:
+            # SGLang server args provided a valid positive value
+            mem_fraction_static = max(0.01, min(0.95, internal_mem_fraction))
             logger.info(f"Using mem_fraction_static from server args: {mem_fraction_static}")
         else:
             # Default to 0.9 (90% of HBM for KV cache)
             mem_fraction_static = 0.9
             logger.info(f"Using default mem_fraction_static: {mem_fraction_static}")
 
-        # Check if the current mem_fraction_static provides sufficient capacity.
-        # All KV cache for running requests must be in HBM during inference,
-        # so mem_fraction_static must provide enough capacity.
-        # When SGLang auto-calculates a bad value (e.g., -2.123) due to large
-        # chunked_prefill_size, we override to 0.9.
-        need_capacity_override = False
+        # Log estimated capacity for diagnostics (but do NOT override)
+        try:
+            from hisim.simulation.utils import estimate_kv_cache_pool_capacity
+            temp_config = SchedulerConfig(
+                model=model,
+                max_prefill_tokens=internal_config.max_prefill_tokens,
+                chunked_prefill_size=internal_config.chunked_prefill_size,
+                mem_fraction_static=mem_fraction_static,
+                tp_size=tp_size,
+                ep_size=ep_size,
+                dp_size=dp_size,
+                data_type=DataType.FP16,
+                kv_cache_data_type=DataType.FP16,
+                page_size=internal_config.page_size,
+                backend_name="sglang",
+            )
+            temp_hw = ConfigManager.get_accelerator_info()
+            estimated_capacity = estimate_kv_cache_pool_capacity(model, temp_hw, temp_config)
+            logger.info(f"Estimated KV cache capacity with mem_fraction_static={mem_fraction_static}: {estimated_capacity} tokens")
+        except Exception as e:
+            logger.debug(f"Could not estimate capacity: {e}")
+
         if mem_fraction_static < 0.5:
-            # Calculate expected capacity with current mem_fraction_static
-            try:
-                from hisim.simulation.utils import estimate_kv_cache_pool_capacity
-                # Note: SchedulerConfig is already imported at module level
-
-                # Create temporary config to check capacity
-                temp_config = SchedulerConfig(
-                    model=model,
-                    max_prefill_tokens=internal_config.max_prefill_tokens,
-                    chunked_prefill_size=internal_config.chunked_prefill_size,
-                    mem_fraction_static=mem_fraction_static,
-                    tp_size=tp_size,
-                    ep_size=ep_size,
-                    dp_size=dp_size,
-                    data_type=DataType.FP16,  # Use FP16 for estimation
-                    kv_cache_data_type=DataType.FP16,
-                    page_size=internal_config.page_size,
-                    backend_name="sglang",
-                )
-
-                temp_hw = ConfigManager.get_accelerator_info()
-                estimated_capacity = estimate_kv_cache_pool_capacity(model, temp_hw, temp_config)
-
-                logger.info(f"Estimated KV cache capacity with mem_fraction_static={mem_fraction_static}: {estimated_capacity} tokens")
-
-                # If capacity is insufficient for 196K requirement, override to 0.9
-                if estimated_capacity < min_required_tokens:
-                    need_capacity_override = True
-                    logger.warning(
-                        f"Insufficient capacity ({estimated_capacity} tokens) with mem_fraction_static={mem_fraction_static} "
-                        f"for required {min_required_tokens} tokens. This is likely caused by SGLang's "
-                        f"automatic mem_fraction_static calculation for large chunked_prefill_size. "
-                        f"Overriding to 0.9 for HiSim simulation."
-                    )
-            except Exception as e:
-                logger.warning(f"Could not estimate capacity: {e}. Using fallback logic.")
-
-        # Apply override only if capacity is truly insufficient.
-        # Previously, any mem_fraction_static < 0.5 was overridden to 0.9, which
-        # prevented users from creating eviction pressure for cache hit rate testing.
-        # Now we only override when SGLang's auto-calculation produced an invalid
-        # value (capacity < min_required_tokens), not when the user intentionally
-        # set a low value.
-        if need_capacity_override:
-            override_fraction = 0.9
-            mem_fraction_static = override_fraction
-            logger.info(f"Overridden mem_fraction_static to {override_fraction} for sufficient capacity")
-        elif mem_fraction_static < 0.5:
             # User intentionally set a low value — warn but don't override.
             # This is useful for testing cache eviction pressure.
-            logger.warning(
-                f"mem_fraction_static={mem_fraction_static} is low. "
-                f"HBM capacity may be insufficient for large concurrent requests, "
-                f"causing aggressive eviction and potential OOM. "
-                f"If this is unintentional (SGLang auto-calculated), set it explicitly."
+            logger.info(
+                f"mem_fraction_static={mem_fraction_static} is low — HBM will have "
+                f"limited capacity, causing aggressive eviction. "
+                f"This is expected for cache hit rate testing."
             )
         dtype = scheduler_config.get("data_type")
         if dtype is not None:
