@@ -773,78 +773,107 @@ class C_HiRadixCacheHook(BaseHook):
             original_reset(self)
 
         def wrapped_evict(self, params):
-            """Override eviction to add a fallback when write_backup fails.
+            """Override eviction to ensure non-backed-up nodes are written to Host before eviction.
 
-            In HiRadixCache with write_back policy, when HBM eviction happens:
-            1. write_backup() tries to write node data to Host
-            2. If Host is full, evict_host() is called to make room
-            3. If evict_host() still can't make room, write_backup() returns 0
-            4. The node stays in HBM and eviction can't proceed
+            In the original HiRadixCache evict(), when a node is not backuped:
+            - write_back policy: calls write_backup() to write to Host first
+            - write_through policy: calls _evict_regular() directly, removing
+              the node from the tree entirely -> NO host data -> NO L2 hits
 
-            The problem: in simulation, Host pool may be intentionally small
-            (hicache_ratio < 1.0) to create eviction pressure. But
-            write_backup failure means HBM can't be freed, causing either OOM
-            or no eviction at all.
+            This is problematic for write_through in simulation: nodes are first
+            inserted into the radix tree (cache_finished_req), but _inc_hit_count
+            only calls write_backup AFTER a cache hit (hit_count >= threshold).
+            If a node is evicted BEFORE being hit again, it has no host_value
+            and gets removed from the tree entirely via _evict_regular.
 
-            Note: wrapped_match_prefix_helper now stops prefix matching at
-            evicted nodes, so nodes evicted via _evict_backuped (which stay
-            in the tree) are no longer matched past. This hook handles the
-            remaining case where write_backup fails entirely — the node is
-            NOT backed up, stays in HBM (value != None, evicted = False),
-            and would still be matched by _match_prefix_helper. We use
-            _evict_regular to force-remove such nodes from the tree.
+            Fix: for ALL write policies (write_through and write_back), when
+            evicting a non-backuped node, first try write_backup() to write
+            its data to Host. Only if write_backup fails (Host pool full),
+            fall back to _evict_regular() to force-remove from tree.
             """
-            result = original_evict(self, params)
+            from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+            import time as _evict_time
 
-            # If eviction didn't free enough tokens, do a second pass
-            # using _evict_regular (which removes nodes from the tree).
-            num_still_need = params.num_tokens - result.num_tokens_evicted
+            start_time = _evict_time.perf_counter()
+            leaves = list(self.evictable_leaves)
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node)
+                for node in leaves
+            ]
+            heapq.heapify(eviction_heap)
+
+            num_evicted = 0
+            write_back_nodes = []
+            while num_evicted < params.num_tokens and len(eviction_heap):
+                _priority, x = heapq.heappop(eviction_heap)
+
+                if x.lock_ref > 0:
+                    continue
+
+                if not x.backuped:
+                    # Try to write to Host first, regardless of write_policy.
+                    # In write_through mode, nodes that haven't been hit enough
+                    # times may not have host_value yet. We write them now so
+                    # they can be discovered as L2 hits later.
+                    written = self.write_backup(x, write_back=True)
+                    num_evicted += written
+                    if written > 0:
+                        write_back_nodes.append(x)
+                else:
+                    num_evicted += self._evict_backuped(x)
+
+                for child in x.parent.children.values():
+                    if child in write_back_nodes:
+                        continue
+                    if not child.evicted:
+                        break
+                else:
+                    # all children are evicted or no children
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+            # Complete any pending write-through operations
+            if write_back_nodes:
+                self.writing_check(write_back=True)
+                for node in write_back_nodes:
+                    assert node.backuped
+                    self._evict_backuped(node)
+
+            # If still not enough tokens freed, do a second pass using
+            # _evict_regular to force-remove nodes from the tree.
+            num_still_need = params.num_tokens - num_evicted
             if num_still_need > 0:
-                # Second pass: evict nodes that couldn't be backed up to host
-                # by forcefully removing them from the tree.
                 leaves = list(self.evictable_leaves)
-                if not leaves:
-                    return result
+                if leaves:
+                    eviction_heap = [
+                        (self.eviction_strategy.get_priority(node), node)
+                        for node in leaves
+                    ]
+                    heapq.heapify(eviction_heap)
 
-                eviction_heap = [
-                    (self.eviction_strategy.get_priority(node), node)
-                    for node in leaves
-                ]
-                heapq.heapify(eviction_heap)
+                    num_force_evicted = 0
+                    while num_force_evicted < num_still_need and len(eviction_heap):
+                        _priority, x = heapq.heappop(eviction_heap)
 
-                num_force_evicted = 0
-                while num_force_evicted < num_still_need and len(eviction_heap):
-                    _priority, x = heapq.heappop(eviction_heap)
+                        if x.lock_ref > 0:
+                            continue
+                        if x.evicted:
+                            continue
+                        if x.backuped:
+                            num_force_evicted += self._evict_backuped(x)
+                        else:
+                            # write_backup failed — Host pool likely full.
+                            # Force-remove from tree to free HBM tokens.
+                            num_force_evicted += self._evict_regular(x)
 
-                    if x.lock_ref > 0:
-                        continue
-                    # Skip nodes already evicted from HBM (value=None)
-                    if x.evicted:
-                        continue
-                    if x.backuped:
-                        # Already backed up, use normal _evict_backuped
-                        num_force_evicted += self._evict_backuped(x)
-                    else:
-                        # Not backed up — write_backup failed. Force-remove from tree.
-                        # This is the key change: instead of keeping the node
-                        # in HBM, we delete it from the tree entirely.
-                        num_force_evicted += self._evict_regular(x)
+                        if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+                            new_priority = self.eviction_strategy.get_priority(x.parent)
+                            heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-                    # Check parent for eviction eligibility
-                    if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                        new_priority = self.eviction_strategy.get_priority(x.parent)
-                        heapq.heappush(eviction_heap, (new_priority, x.parent))
+                    num_evicted += num_force_evicted
 
-                if num_force_evicted > 0:
-                    logger.debug(
-                        f"Force-evicted {num_force_evicted} tokens from tree "
-                        f"(original_evict freed {result.num_tokens_evicted}, "
-                        f"needed {params.num_tokens})"
-                    )
-                    total_evicted = result.num_tokens_evicted + num_force_evicted
-                    return type(result)(num_tokens_evicted=total_evicted)
-
-            return result
+            self.update_eviction_metrics(num_evicted, start_time)
+            return EvictResult(num_tokens_evicted=num_evicted)
 
         def wrapped_match_prefix_helper(self, node, key):
             """Modified _match_prefix_helper that STOPS at evicted nodes.
