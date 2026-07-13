@@ -1377,11 +1377,31 @@ class C_HiRadixCacheHook(BaseHook):
             result = self.inc_lock_ref(ancester_node)
             delta = result.delta
 
+            # Re-validate nodes_to_load: between the walk-up and now,
+            # eviction may have soft-evicted some nodes (host_value→None).
+            # Also protect nodes from host eviction by incrementing host_ref_counter.
+            validated_nodes = []
+            for n in nodes_to_load:
+                if n.host_value is not None:
+                    validated_nodes.append(n)
+                    # Protect from host eviction during load_back
+                    n.host_ref_counter += 1
+                else:
+                    logger.debug(
+                        f"[LoadBack] Node {n.id} lost host_value during load_back setup, skipping"
+                    )
+
+            if not validated_nodes:
+                self.dec_lock_ref(ancester_node)
+                return None
+
             # Load it all or not at all
-            host_indices = torch.cat([n.host_value for n in nodes_to_load])
+            host_indices = torch.cat([n.host_value for n in validated_nodes])
             if len(host_indices) < self.load_back_threshold or (
                 len(host_indices) > mem_quota + delta if mem_quota is not None else False
             ):
+                for n in validated_nodes:
+                    n.host_ref_counter -= 1
                 self.dec_lock_ref(ancester_node)
                 return None
 
@@ -1406,13 +1426,27 @@ class C_HiRadixCacheHook(BaseHook):
                     last_hit_node.id,
                     self.evictable_size_,
                 )
+                for n in validated_nodes:
+                    n.host_ref_counter -= 1
                 return None
 
             self.ongoing_load_back[last_hit_node.id] = last_hit_node
             offset = 0
-            for n in nodes_to_load:
-                n.value = device_indices[offset : offset + len(n.host_value)].clone()
-                offset += len(n.host_value)
+            for n in validated_nodes:
+                if n.host_value is None:
+                    # Host data was freed during eviction triggered by load_back.
+                    # Skip this node — we can't restore what isn't there.
+                    # Still need to release host eviction protection.
+                    n.host_ref_counter -= 1
+                    logger.debug(
+                        f"[LoadBack] Node {n.id} host_value became None during load, skipping value assignment"
+                    )
+                    continue
+                hv_len = len(n.host_value)
+                n.value = device_indices[offset : offset + hv_len].clone()
+                offset += hv_len
+                # Release host eviction protection
+                n.host_ref_counter -= 1
                 self._record_store_event(n, medium=StorageMedium.GPU)
             self.evictable_size_ += len(device_indices)
             self.inc_lock_ref(last_hit_node)
