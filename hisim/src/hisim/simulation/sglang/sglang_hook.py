@@ -1269,6 +1269,128 @@ class C_HiRadixCacheHook(BaseHook):
                     f"(host_pool: {_host_avail_before} -> {_host_avail_after})"
                 )
 
+        def wrapped_load_back(self, node, mem_quota=None):
+            """Override load_back to handle soft-evicted nodes (host_value=None).
+
+            Original load_back walks up from the given node, asserting node.backuped
+            for each evicted ancestor, then loads host data back to device.
+            This crashes when encountering soft-evicted nodes where host_value=None
+            (backuped=False), because:
+            1. assert node.backuped fails
+            2. torch.cat([n.host_value for n in nodes_to_load]) crashes for None
+            3. len(node.host_value) crashes for None
+
+            Fix: Skip soft-evicted nodes in the walk-up. Only collect nodes with
+            actual host data (host_value is not None) into nodes_to_load.
+            """
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+            from sglang.srt.disaggregation.kv_events import StorageMedium
+            import time as _lb_time
+            start_time = _lb_time.perf_counter()
+            last_hit_node = node
+            nodes_to_load = []
+
+            # Walk up from the evicted node, collecting nodes that have host data.
+            # Skip soft-evicted nodes (host_value=None) — their host data is gone.
+            while node.evicted:
+                if node.host_value is not None:
+                    # Node has host data — include in load_back
+                    nodes_to_load.insert(0, node)
+                # else: soft-evicted (host_value=None), skip — no host data to load
+                node = node.parent
+
+            ancester_node = node  # First non-evicted ancestor
+
+            if not nodes_to_load:
+                # All evicted ancestors are soft-evicted (no host data available).
+                # Nothing to load back — return None.
+                logger.debug(
+                    f"[LoadBack] No nodes with host data to load for node_id={last_hit_node.id}"
+                )
+                return None
+
+            # Protect the ancestor nodes from eviction
+            result = self.inc_lock_ref(ancester_node)
+            delta = result.delta
+
+            # Load it all or not at all
+            host_indices = torch.cat([n.host_value for n in nodes_to_load])
+            if len(host_indices) < self.load_back_threshold or (
+                len(host_indices) > mem_quota + delta if mem_quota is not None else False
+            ):
+                self.dec_lock_ref(ancester_node)
+                return None
+
+            device_indices = self.cache_controller.load(
+                host_indices=host_indices,
+                node_id=last_hit_node.id,
+                **self._get_extra_pools(),
+            )
+            if device_indices is None:
+                self.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices,
+                    node_id=last_hit_node.id,
+                    **self._get_extra_pools(),
+                )
+            self.dec_lock_ref(ancester_node)
+            if device_indices is None:
+                logger.warning(
+                    "load_back: FAILED to load %d tokens for node %d "
+                    "even after eviction (evictable_size=%d)",
+                    len(host_indices),
+                    last_hit_node.id,
+                    self.evictable_size_,
+                )
+                return None
+
+            self.ongoing_load_back[last_hit_node.id] = last_hit_node
+            offset = 0
+            for n in nodes_to_load:
+                n.value = device_indices[offset : offset + len(n.host_value)].clone()
+                offset += len(n.host_value)
+                self._record_store_event(n, medium=StorageMedium.GPU)
+            self.evictable_size_ += len(device_indices)
+            self.inc_lock_ref(last_hit_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_load_back_duration(
+                    _lb_time.perf_counter() - start_time
+                )
+                self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+
+            return device_indices
+
+        def wrapped_init_load_back(self, params):
+            """Override init_load_back to handle soft-evicted best_match_node.
+
+            Original init_load_back: if best_match_node is evicted, calls load_back.
+            If load_back fails, walks up until finding a non-evicted node.
+
+            With soft eviction, best_match_node may be evicted AND have no host data.
+            load_back will return None (nothing to load). We then need to find the
+            nearest ancestor with actual host data, or return empty if none exists.
+            """
+            last_node = params.best_match_node
+            mem_quota = params.mem_quota
+            if last_node.evicted:
+                loading_values = self.load_back(last_node, mem_quota)
+                if loading_values is not None:
+                    logger.debug(
+                        f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                    )
+                    return loading_values, last_node
+
+                # load_back returned None — could be soft-evicted (no host data)
+                # or load_back failed (not enough GPU memory). Walk up.
+                while last_node.evicted:
+                    last_node = last_node.parent
+
+            return (
+                self._empty_match_result.device_indices,
+                last_node,
+            )
+
         def wrapped_check_hicache_events(self, *args, **kwargs):
             # Call operation handler first.
             self.cache_controller.handle_backup_operation()
@@ -1280,6 +1402,8 @@ class C_HiRadixCacheHook(BaseHook):
         target.reset = wrapped_reset
         target.evict = wrapped_evict
         target.evict_host = wrapped_evict_host
+        target.load_back = wrapped_load_back
+        target.init_load_back = wrapped_init_load_back
         target.match_prefix = wrapped_match_prefix
         target._match_prefix_helper = wrapped_match_prefix_helper
         return target
