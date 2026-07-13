@@ -792,6 +792,54 @@ class C_HiRadixCacheHook(BaseHook):
             its data to Host. Only if write_backup fails (Host pool full),
             fall back to _evict_regular() to force-remove from tree.
             """
+
+            def _prune_evicted_leaves(cache, node):
+                """Recursively prune evicted leaf descendants from the tree.
+
+                When write_backup fails (host pool full), we cannot preserve
+                host data for a node's children. But the children may already
+                be evicted (value=None) and still in the tree (kept by
+                _evict_backuped). We need to remove these evicted leaf
+                descendants so their parent becomes a leaf and can be
+                _evict_regular'd.
+
+                This function recursively removes evicted leaf children,
+                then checks if their parents become leaves too.
+                """
+                pruned = 0
+                changed = True
+                while changed:
+                    changed = False
+                    to_prune = []
+                    for key, child in list(node.children.items()):
+                        if child.evicted and child.lock_ref == 0 and len(child.children) == 0:
+                            to_prune.append((key, child))
+                    for key, child in to_prune:
+                        node.children.pop(key)
+                        if child in cache.evictable_leaves:
+                            cache.evictable_leaves.remove(child)
+                        if child in cache.evictable_host_leaves:
+                            cache.evictable_host_leaves.remove(child)
+                        pruned += 1
+                        changed = True
+
+                # After pruning immediate children, some deeper paths may
+                # now have evicted leaf grandchildren. We need to prune
+                # recursively for any remaining evicted non-leaf children.
+                for key, child in list(node.children.items()):
+                    if child.evicted and child.lock_ref == 0:
+                        sub_pruned = _prune_evicted_leaves(cache, child)
+                        pruned += sub_pruned
+                        # If child became a leaf after pruning its own children
+                        if len(child.children) == 0:
+                            node.children.pop(key)
+                            if child in cache.evictable_leaves:
+                                cache.evictable_leaves.remove(child)
+                            if child in cache.evictable_host_leaves:
+                                cache.evictable_host_leaves.remove(child)
+                            pruned += 1
+
+                return pruned
             from sglang.srt.mem_cache.base_prefix_cache import EvictResult
             import time as _evict_time
 
@@ -832,10 +880,18 @@ class C_HiRadixCacheHook(BaseHook):
                     else:
                         _wb_fail += 1
                         # write_backup failed (host pool full).
-                        logger.debug(
-                            f"[Evict] write_backup FAILED: node_id={x.id} "
-                            f"value_len={_node_value_len} host_avail={_host_avail}"
-                        )
+                        # Try to prune evicted descendants and then _evict_regular
+                        # to free HBM tokens even without host backup.
+                        _pruned = _prune_evicted_leaves(self, x)
+                        if len(x.children) == 0:
+                            # Now a leaf — can use _evict_regular
+                            num_evicted += self._evict_regular(x)
+                            _evict_regular_count += 1
+                        else:
+                            logger.debug(
+                                f"[Evict] write_backup FAILED: node_id={x.id} "
+                                f"value_len={_node_value_len} host_avail={_host_avail}"
+                            )
                 else:
                     num_evicted += self._evict_backuped(x)
                     _evict_backuped_count += 1
@@ -890,13 +946,21 @@ class C_HiRadixCacheHook(BaseHook):
                             _evict_regular_count += 1
                         else:
                             # Not backed up AND has children — cannot _evict_regular
-                            # (assertion: len(node.children) == 0).
+                            # directly (assertion: len(node.children) == 0).
                             # This happens when children were evicted via
-                            # _evict_backuped (stay in tree) but parent
-                            # still has HBM value. Skip for now — the
-                            # children will eventually be removed by
-                            # evict_host, freeing the parent.
-                            continue
+                            # _evict_backuped (stay in tree with value=None)
+                            # but parent still has HBM value.
+                            #
+                            # Fix: prune evicted leaf descendants from the tree
+                            # first. Since write_backup failed, the host pool
+                            # is full — these nodes have no host data to
+                            # preserve. Removing them makes the parent a leaf,
+                            # allowing _evict_regular.
+                            _pruned = _prune_evicted_leaves(self, x)
+                            if len(x.children) == 0:
+                                num_force_evicted += self._evict_regular(x)
+                                _evict_regular_count += 1
+                            # else: still has non-evicted or non-leaf children — skip
 
                         if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                             new_priority = self.eviction_strategy.get_priority(x.parent)
