@@ -968,6 +968,15 @@ class C_HiRadixCacheHook(BaseHook):
                         # child so match_prefix can compute host_hit_length,
                         # then break — do NOT continue past evicted nodes.
                         node = child
+                        if child.host_value is None:
+                            # Node was soft-evicted from Host (host_value freed,
+                            # but kept in tree for structure preservation.
+                            # Continue walking to find deeper non-evicted nodes for L1 hits.
+                            node = child
+                            key = key[prefix_len:]
+                            if len(key):
+                                child_key = key.child_key(self.page_size)
+                            continue
                         logger.debug(
                             f"[MatchPrefix] Stopped at evicted boundary: "
                             f"node_id={child.id} key_len={len(child.key)} "
@@ -976,6 +985,58 @@ class C_HiRadixCacheHook(BaseHook):
                         break
 
             return value, node
+
+        def wrapped_match_prefix(self, params):
+            """Override match_prefix to handle soft-evicted nodes (host_value=None).
+
+            After evict_host soft-evicts a node (frees host memory but keeps
+            the node in the tree), the node has evicted=True but host_value=None.
+            The original match_prefix walks up from last_node and does:
+                while last_node.evicted:
+                    host_hit_length += len(last_node.host_value)  # CRASH if None!
+            We fix this by skipping nodes with host_value=None in the walk-up.
+            """
+            if self.disable:
+                return self._empty_match_result
+
+            key = params.key
+            key, _ = key.maybe_to_bigram_view(self.is_eagle)
+            key = key.page_aligned(self.page_size)
+            if len(key) == 0:
+                return self._empty_match_result
+
+            value, last_node = self._match_prefix_helper(self.root_node, key)
+            if value:
+                value = torch.cat(value)
+            else:
+                value = self._empty_match_result.device_indices
+
+            host_hit_length = 0
+            last_host_node = last_node
+            # Walk up from last_node, computing host_hit_length.
+            # Skip nodes with host_value=None (soft-evicted from Host).
+            while last_node.evicted:
+                if last_node.host_value is not None:
+                    host_hit_length += len(last_node.host_value)
+                else:
+                    # Soft-evicted: host data freed, skip in host_hit_length.
+                    # Still continue walking up to find ancestor nodes with host data.
+                    pass
+                last_node = last_node.parent
+
+            # Find last_host_node: walk up until we find a backuped node.
+            # For soft-evicted nodes (host_value=None), backuped=False, so they're skipped.
+            while not last_host_node.backuped and last_host_node != self.root_node:
+                last_host_node = last_host_node.parent
+
+            from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+            return MatchResult(
+                device_indices=value,
+                last_device_node=last_node,
+                last_host_node=last_host_node,
+                best_match_node=last_host_node,
+                host_hit_length=host_hit_length,
+            )
 
         def override_init(self, params, server_args):
             if server_args.hicache_io_backend == "direct":
@@ -1137,28 +1198,76 @@ class C_HiRadixCacheHook(BaseHook):
             target.__mro__[1].__init__(self, params=params)
 
         def wrapped_evict_host(self, num_tokens: int):
-            """Override evict_host to log when nodes are removed from the tree.
+            """Override evict_host to SOFT-evict: free host memory but keep nodes in tree.
 
             Original evict_host removes nodes from parent.children (parent.children.pop),
             which makes them undiscoverable by match_prefix — no L2 hits possible.
+
+            Fix: Instead of removing the node from the tree, we only free the host
+            memory (set host_value=None) and keep the node in the tree. This preserves
+            the tree structure so that:
+            1. match_prefix can still discover the node (it's still in parent.children)
+            2. If the node's value is also None (evicted from HBM), our modified
+               _match_prefix_helper will treat it as a "permanently evected" boundary
+               — it continues walking to deeper non-evected children.
+            3. Deeper non-evected nodes remain discoverable for L1 hits.
+
+            Nodes with host_value=None after this "soft eviction" are considered
+            "host-evected" — their L2 data is gone, but the tree path is preserved.
             """
             _host_leaves_before = len(self.evictable_host_leaves)
             _host_avail_before = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
 
-            # Call the original evict_host (saved before we override)
-            result = original_evict_host(self, num_tokens)
+            leaves = list(self.evictable_host_leaves)
+            eviction_heap = [
+                (self.eviction_strategy.get_priority(node), node) for node in leaves
+            ]
+            heapq.heapify(eviction_heap)
 
-            _host_leaves_after = len(self.evictable_host_leaves)
-            _host_avail_after = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
-            _removed = _host_leaves_before - _host_leaves_after
+            num_freed = 0
+            _soft_evicted = 0
+            while num_freed < num_tokens and len(eviction_heap):
+                _priority, x = heapq.heappop(eviction_heap)
+                if x == self.root_node:
+                    break
+                if not x.evicted:
+                    continue
+                if x.host_ref_counter > 0:
+                    continue
+                if x.host_value is None:
+                    # Already soft-evicted, no host data to free.
+                    continue
 
-            if _removed > 0:
+                # Soft eviction: free host memory but KEEP node in the tree.
+                # Original code: parent.children.pop(key) → removes from tree
+                # New code: just set host_value=None → stays in tree
+                num_freed += self.cache_controller.evict_host(x.host_value)
+                x.host_value = None  # Clear host data (was backed up, now freed)
+
+                # Remove from evictable_host_leaves since host_value is gone
+                if x in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(x)
+                self._update_host_leaf_status(x.parent)
+
+                # Check if parent should become a host leaf
+                # (parent is evicted and now all children have no host_value)
+                if x.parent.evicted and x.parent not in self.evictable_host_leaves:
+                    all_children_host_freed = True
+                    for child in x.parent.children.values():
+                        if child.host_value is not None:
+                            all_children_host_freed = False
+                            break
+                    if all_children_host_freed and x.parent.host_value is not None:
+                        self.evictable_host_leaves.add(x.parent)
+
+                _soft_evicted += 1
+
+            if _soft_evicted > 0:
+                _host_avail_after = self.cache_controller.mem_pool_host.available_size() if hasattr(self.cache_controller, 'mem_pool_host') else -1
                 logger.info(
-                    f"[EvictHost] removed ~{_removed} nodes from tree "
+                    f"[EvictHost] soft-evicted {_soft_evicted} nodes (kept in tree) "
                     f"(host_pool: {_host_avail_before} -> {_host_avail_after})"
                 )
-
-            return result
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
             # Call operation handler first.
@@ -1171,6 +1280,7 @@ class C_HiRadixCacheHook(BaseHook):
         target.reset = wrapped_reset
         target.evict = wrapped_evict
         target.evict_host = wrapped_evict_host
+        target.match_prefix = wrapped_match_prefix
         target._match_prefix_helper = wrapped_match_prefix_helper
         return target
 
