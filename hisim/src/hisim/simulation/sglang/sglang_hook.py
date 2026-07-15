@@ -982,28 +982,25 @@ class C_HiRadixCacheHook(BaseHook):
             return EvictResult(num_tokens_evicted=num_evicted)
 
         def wrapped_match_prefix_helper(self, node, key):
-            """Modified _match_prefix_helper that STOPS at evicted nodes.
+            """Modified _match_prefix_helper that walks past evicted nodes.
 
             In the original HiRadixCache, _match_prefix_helper continues
             walking past evicted nodes (node = child even when child.evicted).
-            This means the prefix match extends through eviction boundaries,
-            and nodes deeper in the tree (past evicted ancestors) are still
-            discoverable even though their parent was evicted from HBM.
+            This means the prefix match extends through eviction boundaries.
 
             The user's requirement: when HBM tokens are reallocated (eviction),
             the corresponding hash must be removed from the HBM radix tree.
-            Future requests should NOT be able to match past the eviction
-            boundary from the device perspective. The evicted node can only
-            be hit in Host (via load_back) or Disk.
+            Future requests should NOT match past the eviction boundary when
+            counting device_indices (L1 hits). However, the traversal should
+            still continue past evicted nodes so that:
+            - Deeper non-evicted nodes are correctly included in device_indices (L1)
+            - The walk-up in match_prefix correctly computes host_hit_length (L2)
+              from the full chain of evicted ancestors back to the root.
 
-            Implementation: when we encounter an evicted child during the
-            tree walk, we set node = child (to preserve last_node for
-            host_hit_length calculation in match_prefix) and then break
-            the walk. This ensures:
-            - value only contains non-evicted (HBM) values
-            - last_node is the evicted node at the boundary
-            - match_prefix's walk-up logic correctly computes host_hit_length
-            - Deeper nodes (children of evicted nodes) are NOT discovered
+            Implementation: continue walking past evicted nodes, but only
+            collect non-evicted values into device_indices. Unlike the original
+            code (which also skips evicted values), this version handles
+            soft-evicted nodes (host_value=None) by continuing the walk.
             """
             import time as _time
             node.last_access_time = _time.monotonic()
@@ -1023,30 +1020,12 @@ class C_HiRadixCacheHook(BaseHook):
                 else:
                     if not child.evicted:
                         value.append(child.value)
-                        node = child
-                        key = key[prefix_len:]
-                        if len(key):
-                            child_key = key.child_key(self.page_size)
-                    else:
-                        # STOP at eviction boundary: set node to the evicted
-                        # child so match_prefix can compute host_hit_length,
-                        # then break — do NOT continue past evicted nodes.
-                        node = child
-                        if child.host_value is None:
-                            # Node was soft-evicted from Host (host_value freed,
-                            # but kept in tree for structure preservation.
-                            # Continue walking to find deeper non-evicted nodes for L1 hits.
-                            node = child
-                            key = key[prefix_len:]
-                            if len(key):
-                                child_key = key.child_key(self.page_size)
-                            continue
-                        logger.debug(
-                            f"[MatchPrefix] Stopped at evicted boundary: "
-                            f"node_id={child.id} key_len={len(child.key)} "
-                            f"backuped={child.backuped}"
-                        )
-                        break
+                    # Always continue walking, regardless of eviction state.
+                    # Only skip collecting value for evicted nodes.
+                    node = child
+                    key = key[prefix_len:]
+                    if len(key):
+                        child_key = key.child_key(self.page_size)
 
             return value, node
 
@@ -1059,6 +1038,12 @@ class C_HiRadixCacheHook(BaseHook):
                 while last_node.evicted:
                     host_hit_length += len(last_node.host_value)  # CRASH if None!
             We fix this by skipping nodes with host_value=None in the walk-up.
+
+            Note: wrapped_match_prefix_helper now walks past evicted nodes
+            (does NOT break at the eviction boundary). This means last_node
+            is deeper in the tree, and the walk-up accumulates host_hit_length
+            from the full chain of evicted ancestors, properly accounting for
+            L2 (Memory) hits.
             """
             if self.disable:
                 return self._empty_match_result
