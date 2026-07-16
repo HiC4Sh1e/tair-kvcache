@@ -63,6 +63,7 @@ class RequestStats:
     gen_token_latencies: list[float] = field(default_factory=list)
     session_id: Optional[str] = None
     parent_session_id: Optional[str] = None
+    session_end: bool = False
     memory_hit_tokens: int = 0
 
     def is_complete(self) -> bool:

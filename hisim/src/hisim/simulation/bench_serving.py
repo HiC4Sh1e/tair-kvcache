@@ -27,6 +27,7 @@ import traceback
 import uuid
 import warnings
 from argparse import ArgumentParser
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
 from datetime import datetime
@@ -1777,6 +1778,8 @@ def sample_hisim_collection_requests(
             simulation["parent_session_id"] = item["parent_session_id"]
         if "cache_control" in item:
             simulation["cache_control"] = item["cache_control"]
+        if "session_end" in item and item["session_end"]:
+            simulation["session_end"] = True
 
         input_requests.append(
             DatasetRow(
@@ -2316,70 +2319,159 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and args.dataset_name == "mooncake"
-    ):  # Assuming mooncake is mainly for sglang or similar backends
-        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-        )
-        print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
-        )
-        pbar_total *= args.mooncake_num_rounds
-    elif backend == "sglang" and args.dataset_name == "hisim-collection":
-        request_generator = get_request(
-            input_requests, -1, use_trace_timestamps=True, timestamp_scale_s=1
-        )
-    else:
-        request_generator = get_request(input_requests, request_rate)
 
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
+    # Prepare LoRA request distribution parameters (shared by both paths)
+    lora_idx = 0 if lora_request_distribution == "distinct" else None
+    if lora_request_distribution == "skewed" and lora_names is not None and len(lora_names) > 0:
+        lora_probs = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+        lora_probs = lora_probs / np.sum(lora_probs)
     else:
-        lora_idx = None
         lora_probs = None
 
-    pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    async for request in request_generator:
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
-            else:
-                assert lora_request_distribution == "skewed", (
-                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-                )
-
-                lora_name = np.random.choice(lora_names, p=lora_probs)
-        else:
-            lora_name = None
-
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
-            api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=extra_request_body,
-            timestamp=request.timestamp,
-            simulation=request.simulation,
+    # Detect session-aware mode: dataset has session_id AND max_concurrency is set
+    _has_sessions = False
+    if max_concurrency is not None and args.dataset_name == "hisim-collection":
+        _has_sessions = any(
+            req.simulation.get("session_id") is not None
+            for req in input_requests[:min(100, len(input_requests))]
         )
 
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+    if _has_sessions:
+        # Session-aware concurrent benchmark:
+        # Each concurrent slot = one session.
+        # Within a session, requests are strictly serialized (await each before next).
+        # After a session completes, the slot picks the next session from the queue.
+
+        # Add simulation params to all requests
+        for idx, req in enumerate(input_requests):
+            req.simulation["total_request"] = len(input_requests)
+            if "created_time" not in req.simulation:
+                req.simulation["created_time"] = req.timestamp if req.timestamp else 0
+
+        # Group requests by session_id, preserving order within session
+        sessions: dict[str, list[tuple[int, DatasetRow]]] = defaultdict(list)
+        session_order = []
+        for idx, req in enumerate(input_requests):
+            sid = req.simulation.get("session_id")
+            if sid is None:
+                sid = f"__no_session_{idx}"
+            if sid not in sessions:
+                session_order.append(sid)
+            sessions[sid].append((idx, req))
+
+        print(
+            f"Session-aware mode: {len(input_requests)} requests in "
+            f"{len(session_order)} sessions, max_concurrency={max_concurrency}"
+        )
+        pbar_total = len(input_requests)
+        pbar = None if disable_tqdm else tqdm(total=pbar_total)
+
+        # Create a shared session queue
+        session_queue = asyncio.Queue()
+        for sid in session_order:
+            session_queue.put_nowait(sid)
+
+        # Collect outputs indexed by original position
+        output_dict: dict[int, RequestFuncOutput] = {}
+
+        async def session_worker():
+            while True:
+                try:
+                    sid = session_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                for idx, req in sessions[sid]:
+                    # Handle LoRA
+                    if lora_names is not None and len(lora_names) != 0:
+                        if lora_request_distribution == "uniform":
+                            _lora_name = random.choice(lora_names)
+                        elif lora_request_distribution == "distinct":
+                            _lora_name = lora_names[0]  # simplified for session mode
+                        else:
+                            _lora_name = np.random.choice(lora_names, p=lora_probs) if lora_probs is not None else None
+                    else:
+                        _lora_name = None
+
+                    request_func_input = RequestFuncInput(
+                        model=model_id,
+                        prompt=req.prompt,
+                        api_url=api_url,
+                        prompt_len=req.prompt_len,
+                        output_len=req.output_len,
+                        lora_name=_lora_name,
+                        image_data=req.image_data,
+                        extra_request_body=extra_request_body,
+                        timestamp=req.timestamp,
+                        simulation=req.simulation,
+                    )
+                    # Strictly serial within session: await completion before next request
+                    output = await request_func(
+                        request_func_input=request_func_input, pbar=pbar
+                    )
+                    output_dict[idx] = output
+
+        workers = [asyncio.create_task(session_worker()) for _ in range(max_concurrency)]
+        await asyncio.gather(*workers)
+
+        # Reassemble outputs in original order for calculate_metrics
+        outputs = [output_dict.get(i, RequestFuncOutput()) for i in range(len(input_requests))]
+
+    else:
+        # Default path: all requests launched as concurrent tasks
+        if (
+            backend == "sglang" and args.dataset_name == "mooncake"
+        ):  # Assuming mooncake is mainly for sglang or similar backends
+            print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
+            request_generator = get_mooncake_request_over_time(
+                input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+            print(
+                f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
+            )
+            pbar_total *= args.mooncake_num_rounds
+        elif backend == "sglang" and args.dataset_name == "hisim-collection":
+            request_generator = get_request(
+                input_requests, -1, use_trace_timestamps=True, timestamp_scale_s=1
+            )
+        else:
+            request_generator = get_request(input_requests, request_rate)
+
+        pbar = None if disable_tqdm else tqdm(total=pbar_total)
+        async for request in request_generator:
+            if lora_names is not None and len(lora_names) != 0:
+                if lora_request_distribution == "uniform":
+                    lora_name = random.choice(lora_names)
+                elif lora_request_distribution == "distinct":
+                    lora_name = lora_names[lora_idx]
+                    lora_idx = (lora_idx + 1) % len(lora_names)
+                else:
+                    assert lora_request_distribution == "skewed", (
+                        f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                    )
+
+                    lora_name = np.random.choice(lora_names, p=lora_probs)
+            else:
+                lora_name = None
+
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=extra_request_body,
+                timestamp=request.timestamp,
+                simulation=request.simulation,
+            )
+
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                )
+            )
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     # Stop profiler or simulation
     if args.bench_mode == "simulation" and args.enable_profiling:

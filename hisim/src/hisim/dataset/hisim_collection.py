@@ -59,6 +59,7 @@ class HisimCollectionDataset(BaseDataset):
                     session_id=req.get("session_id"),
                     parent_session_id=req.get("parent_session_id"),
                     cache_control=req.get("cache_control"),
+                    session_end=req.get("session_end"),
                 )
             )
 

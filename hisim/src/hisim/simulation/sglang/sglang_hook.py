@@ -125,6 +125,7 @@ class C_TokenizerManagerHook(BaseHook):
                         if session_id is not None:
                             req_stats.session_id = session_id
                             req_stats.parent_session_id = simulation_args.get("parent_session_id")
+                            req_stats.session_end = simulation_args.get("session_end", False)
                     else:
                         # Fallback for simulation tracking
                         req_stats.created_time = now
@@ -167,6 +168,7 @@ class C_TokenizerManagerHook(BaseHook):
                         if session_id is not None:
                             req_stats.session_id = session_id
                             req_stats.parent_session_id = simulation_args.get("parent_session_id")
+                            req_stats.session_end = simulation_args.get("session_end", False)
                     else:
                         # Fallback for basic tracking
                         req_stats.created_time = created_time
@@ -1504,6 +1506,9 @@ SESSION_TTL_TABLE: dict[str, float] = {}
 # Key = TreeNode.id, Value = set of session_ids that own this node.
 NODE_OWNERS: dict[int, set[str]] = {}
 
+# Maps TreeNode.id → TreeNode reference for efficient node lookup during cleanup.
+NODE_MAP: dict[int, object] = {}
+
 
 def _update_session_ttl(session_id: str, cache_control: dict):
     """Update/refresh session TTL. Last TTL wins (overwrites previous)."""
@@ -1547,6 +1552,7 @@ def _tag_node_with_session(node, session_id: str):
     if node is None or session_id is None:
         return
     node_id = node.id
+    NODE_MAP[node_id] = node  # Store reference for cleanup
     if node_id not in NODE_OWNERS:
         NODE_OWNERS[node_id] = set()
     NODE_OWNERS[node_id].add(session_id)
@@ -1572,11 +1578,121 @@ def _remove_node_ownership(node):
         return
     node_id = node.id
     NODE_OWNERS.pop(node_id, None)
+    NODE_MAP.pop(node_id, None)
 
 
 def _clear_node_ownership():
     """Clear all node ownership tracking."""
     NODE_OWNERS.clear()
+    NODE_MAP.clear()
+
+
+def _cleanup_session_kv(session_id: str, tree_cache):
+    """Clean up KV cache for a session that has ended.
+
+    Only removes nodes EXCLUSIVELY owned by this session.
+    Shared nodes only have this session's ownership removed.
+    """
+    if session_id is None:
+        return
+
+    # 1. Find exclusively-owned nodes and clean ownership
+    exclusive_node_ids = []
+    for node_id in list(NODE_OWNERS.keys()):
+        owners = NODE_OWNERS.get(node_id)
+        if owners is None or session_id not in owners:
+            continue
+        owners.discard(session_id)
+        if len(owners) == 0:
+            exclusive_node_ids.append(node_id)
+            NODE_OWNERS.pop(node_id, None)
+        # else: shared node, ownership already removed
+
+    # 2. Sort exclusive nodes by depth (deepest first)
+    #    This ensures children are evicted before parents,
+    #    so parents become leaves and can be deleted.
+    exclusive_nodes = []
+    for nid in exclusive_node_ids:
+        node = NODE_MAP.get(nid)
+        if node is not None and node is not tree_cache.root_node:
+            exclusive_nodes.append(node)
+
+    def _node_depth(n):
+        d = 0
+        while n.parent is not None and n is not tree_cache.root_node:
+            d += 1
+            n = n.parent
+        return d
+
+    exclusive_nodes.sort(key=_node_depth, reverse=True)
+
+    # 3. Evict exclusive nodes bottom-up
+    is_hiradix = hasattr(tree_cache, 'cache_controller')
+    total_freed = 0
+    for node in exclusive_nodes:
+        # Skip if node already deleted from tree (parent.children was cleared)
+        if node.parent is None or node not in node.parent.children.values():
+            continue
+        # Skip if node has non-evicted children (not a leaf)
+        if any(not c.evicted for c in node.children.values()):
+            # Still has active children — just evict this node's value
+            # but don't remove from tree
+            if node.value is not None:
+                tree_cache.token_to_kv_pool_allocator.free(node.value)
+                node.value = None
+                # evicted is a property that returns value is None, so setting value=None makes evicted=True
+                total_freed += len(node.key) if hasattr(node, 'key') and node.key is not None else 0
+            # Handle L2 (host_value) for HiRadixCache
+            if is_hiradix and getattr(node, 'host_value', None) is not None:
+                tree_cache.cache_controller.evict_host(node.host_value)
+                node.host_value = None
+            continue
+
+        # Leaf node (or all children are evicted) — can fully delete
+        # For leaf nodes with no children, we can call _delete_leaf first
+        # (which removes from tree and updates evictable_size_),
+        # then free the KV pool slots.
+        # For nodes with only evicted children, soft-evict by setting value=None.
+        if len(node.children) == 0:
+            # True leaf: remove from tree, then free memory
+            # _delete_leaf expects node.value to be non-None (not evicted)
+            # so we must call it BEFORE freeing node.value
+            if node.value is not None:
+                total_freed += len(node.value)
+                node_value = node.value  # save reference for freeing after _delete_leaf
+                tree_cache._delete_leaf(node)
+                tree_cache.token_to_kv_pool_allocator.free(node_value)
+            else:
+                # Already evicted, just remove from tree
+                # Can't use _delete_leaf since it expects non-evicted nodes,
+                # so remove manually
+                key = node.key.child_key(tree_cache.page_size)
+                node.parent.children.pop(key, None)
+            _remove_node_ownership(node)
+            NODE_MAP.pop(node.id, None)
+        else:
+            # Has evicted children — soft evict (set value=None)
+            if node.value is not None:
+                total_freed += len(node.value)
+                tree_cache.token_to_kv_pool_allocator.free(node.value)
+                node.value = None
+            # Handle L2 (host_value) for HiRadixCache
+            if is_hiradix and getattr(node, 'host_value', None) is not None:
+                tree_cache.cache_controller.evict_host(node.host_value)
+                node.host_value = None
+
+    # 4. Remove session TTL
+    SESSION_TTL_TABLE.pop(session_id, None)
+
+    # 5. Clean up NODE_MAP for removed nodes
+    for nid in exclusive_node_ids:
+        NODE_MAP.pop(nid, None)
+
+    if total_freed > 0:
+        logger.info(
+            f"[SessionEnd] session={session_id} freed {total_freed} tokens "
+            f"({len(exclusive_nodes)} exclusive nodes cleaned)"
+        )
 
 
 class C_SchedulerHook(BaseHook):
@@ -2753,6 +2869,7 @@ class C_SchedulerRequestReceiverHook(BaseHook):
                     if session_id is not None:
                         req_stats.session_id = session_id
                         req_stats.parent_session_id = simulation_args.get("parent_session_id")
+                        req_stats.session_end = simulation_args.get("session_end", False)
 
             if recv_reqs and getattr(C_SchedulerHook, 'LAST_CPU_TS', None) == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
@@ -2914,7 +3031,7 @@ class C_RadixCacheFixHook(BaseHook):
         original_cache_finished_req = target.cache_finished_req
 
         def wrapped_cache_finished_req(self, req, is_insert=True):
-            """Wrap cache_finished_req to track node→session ownership."""
+            """Wrap cache_finished_req to track node→session ownership and handle session-end cleanup."""
             # Call original method first
             original_cache_finished_req(self, req, is_insert)
 
@@ -2931,6 +3048,10 @@ class C_RadixCacheFixHook(BaseHook):
             while node is not None and node is not self.root_node:
                 _tag_node_with_session(node, session_id)
                 node = node.parent
+
+            # Session-end cleanup: evict exclusively-owned KV nodes
+            if sim_args.get("session_end", False):
+                _cleanup_session_kv(session_id, self)
 
         if hasattr(target, 'cache_finished_req'):
             target.cache_finished_req = wrapped_cache_finished_req

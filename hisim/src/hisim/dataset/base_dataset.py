@@ -15,6 +15,7 @@ class GenericRequest:
     session_id: Optional[str] = None
     parent_session_id: Optional[str] = None
     cache_control: Optional[dict] = None  # {"type": "ephemeral", "ttl": 5}
+    session_end: Optional[bool] = None
 
     def __post_init__(self):
         if self.prompt is None and self.token_ids is None:

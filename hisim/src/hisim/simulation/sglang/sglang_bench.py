@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from collections import defaultdict
 import asyncio
 import json
 import os
@@ -102,6 +103,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                 "session_id": req.session_id,
                 "parent_session_id": req.parent_session_id,
                 "cache_control": req.cache_control,
+                "session_end": req.session_end,
             }
             if with_queue_start:
                 simulation_params["queue_start"] = req.custom_params.get("queue_start")
@@ -136,31 +138,13 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                 # clear data
                 pass
 
-        tasks = []
-        logger.info(f"Created {len(dataset)} request tasks.")
-        for req, simulation_params in self.get_request(
-            dataset,
-            ignore_timestamp=benchmark_config.ignore_request_timestamp,
-            with_queue_start=benchmark_config.with_queue_start,
-            request_rate=benchmark_config.request_rate,
-        ):
-            task = asyncio.create_task(
-                self.engine.async_generate(
-                    prompt=req.prompt,
-                    input_ids=req.token_ids,
-                    sampling_params={
-                        "ignore_eos": True,
-                        "max_new_tokens": req.output_length,
-                        "custom_params": {
-                            # (tmp) Transfer simulation arguments to the scheduler through the custom_params in sampling_params
-                            "simulation": simulation_params
-                        },
-                    },
-                )
-            )
-            tasks.append(task)
+        # Detect session-aware dataset
+        has_sessions = len(dataset) > 0 and getattr(dataset[0], 'session_id', None) is not None
 
-        _ = await asyncio.gather(*tasks)
+        if has_sessions and benchmark_config.max_concurrency is not None:
+            await self._async_benchmark_session_aware(benchmark_config, dataset)
+        else:
+            await self._async_benchmark_default(benchmark_config, dataset)
 
         # dump result
         await self.engine.tokenizer_manager.start_profile()
@@ -175,6 +159,90 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
             return None
 
         return metrics
+
+    async def _async_benchmark_default(self, benchmark_config, dataset):
+        """Original benchmark: all requests launched as concurrent tasks."""
+        tasks = []
+        logger.info(f"Created {len(dataset)} request tasks (default mode).")
+        for req, simulation_params in self.get_request(
+            dataset,
+            ignore_timestamp=benchmark_config.ignore_request_timestamp,
+            with_queue_start=benchmark_config.with_queue_start,
+            request_rate=benchmark_config.request_rate,
+        ):
+            task = asyncio.create_task(
+                self.engine.async_generate(
+                    prompt=req.prompt,
+                    input_ids=req.token_ids,
+                    sampling_params={
+                        "ignore_eos": True,
+                        "max_new_tokens": req.output_length,
+                        "custom_params": {
+                            "simulation": simulation_params
+                        },
+                    },
+                )
+            )
+            tasks.append(task)
+
+        _ = await asyncio.gather(*tasks)
+
+    async def _async_benchmark_session_aware(self, benchmark_config, dataset):
+        """Session-aware concurrent benchmark.
+
+        Each concurrent slot = one session.
+        Within a session, requests are sent serially (await each one).
+        After session completes, slot picks next available session.
+        """
+        # 1. Group requests by session_id, preserving order within session
+        sessions: dict[str, list[tuple[GenericRequest, dict]]] = defaultdict(list)
+        session_order = []  # preserve insertion order
+        for req, simulation_params in self.get_request(
+            dataset,
+            ignore_timestamp=benchmark_config.ignore_request_timestamp,
+            with_queue_start=benchmark_config.with_queue_start,
+            request_rate=benchmark_config.request_rate,
+        ):
+            sid = req.session_id
+            if sid not in sessions:
+                session_order.append(sid)
+            sessions[sid].append((req, simulation_params))
+
+        logger.info(
+            f"Session-aware mode: {len(dataset)} requests in "
+            f"{len(session_order)} sessions, "
+            f"max_concurrency={benchmark_config.max_concurrency}"
+        )
+
+        # 2. Create a shared session queue
+        session_queue = asyncio.Queue()
+        for sid in session_order:
+            session_queue.put_nowait(sid)
+
+        # 3. Worker coroutines (one per concurrent slot)
+        async def session_worker():
+            while True:
+                try:
+                    sid = session_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                # Process all requests in this session serially
+                for req, sim_params in sessions[sid]:
+                    await self.engine.async_generate(
+                        prompt=req.prompt,
+                        input_ids=req.token_ids,
+                        sampling_params={
+                            "ignore_eos": True,
+                            "max_new_tokens": req.output_length,
+                            "custom_params": {"simulation": sim_params},
+                        },
+                    )
+                # Session complete — worker will pick next session in next iteration
+
+        # 4. Launch workers
+        max_concurrency = benchmark_config.max_concurrency
+        workers = [asyncio.create_task(session_worker()) for _ in range(max_concurrency)]
+        await asyncio.gather(*workers)
 
     def benchmark(
         self,
