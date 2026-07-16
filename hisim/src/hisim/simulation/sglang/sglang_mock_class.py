@@ -727,6 +727,24 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
         # )
 
         bs = len(prefix_lens)
+
+        # Pre-validate page availability BEFORE calling alloc_extend_cpu.
+        # Without this, alloc_extend_cpu crashes with IndexError when
+        # free_pages doesn't have enough pages (it accesses free_pages[i]
+        # without bounds checking).
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        if num_new_pages > len(self.free_pages):
+            logger.warning(
+                f"Memory allocation failed: need {num_new_pages} pages, "
+                f"but only {len(self.free_pages)} free pages available. "
+                f"seq_lens={seq_lens_cpu.tolist()}, prefix_lens={prefix_lens_cpu.tolist()}"
+            )
+            return None
+
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
@@ -746,20 +764,6 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
             page_size=self.page_size,
             max_num_extend_tokens=None,
         )
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu,
-        )
-        if num_new_pages > len(self.free_pages):
-            # 内存不足：返回None，out_indices被放弃，free_pages保持不变
-            logger.warning(
-                f"Memory allocation failed: need {num_new_pages} pages, "
-                f"but only {len(self.free_pages)} free pages available. "
-                f"seq_lens={seq_lens_cpu.tolist()}, prefix_lens={prefix_lens_cpu.tolist()}"
-            )
-            return None
 
         # 内存足够：更新free_pages使用状态
         self.free_pages = self.free_pages[num_new_pages:]

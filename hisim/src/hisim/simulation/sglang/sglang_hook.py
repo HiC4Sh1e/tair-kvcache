@@ -1423,6 +1423,14 @@ class C_HiRadixCacheHook(BaseHook):
             )
             if device_indices is None:
                 self.evict(EvictParams(num_tokens=len(host_indices)))
+                # Diagnostic: check allocator state after eviction
+                _alloc_free_pages = len(self.cache_controller.mem_pool_device_allocator.free_pages)
+                _need_pages = (len(host_indices) + self.page_size - 1) // self.page_size
+                logger.info(
+                    f"[LoadBack] After eviction: allocator_free_pages={_alloc_free_pages} "
+                    f"need_pages={_need_pages} need_tokens={len(host_indices)} "
+                    f"page_size={self.page_size}"
+                )
                 device_indices = self.cache_controller.load(
                     host_indices=host_indices,
                     node_id=last_hit_node.id,
@@ -1430,12 +1438,14 @@ class C_HiRadixCacheHook(BaseHook):
                 )
             self.dec_lock_ref(ancester_node)
             if device_indices is None:
+                _alloc_free_pages = len(self.cache_controller.mem_pool_device_allocator.free_pages)
                 logger.warning(
                     "load_back: FAILED to load %d tokens for node %d "
-                    "even after eviction (evictable_size=%d)",
+                    "even after eviction (evictable_size=%d, free_pages=%d)",
                     len(host_indices),
                     last_hit_node.id,
                     self.evictable_size_,
+                    _alloc_free_pages,
                 )
                 for n in validated_nodes:
                     n.host_ref_counter -= 1
@@ -1504,7 +1514,14 @@ class C_HiRadixCacheHook(BaseHook):
         def wrapped_check_hicache_events(self, *args, **kwargs):
             nonlocal _hicache_event_count
             _hicache_event_count += 1
-            # Call operation handler first.
+            # CRITICAL: Process completed write-through operations FIRST.
+            # writing_check() drains ack_write_queue → _finish_write_through_ack
+            # → write_backup_storage → backup_queue.put. Without this, the
+            # backup_queue is empty when handle_backup_operation runs, and
+            # storage (L3) never gets populated before prefetch queries it.
+            self.writing_check()
+            # Now process backup_queue (which was just filled by writing_check)
+            # and prefetch_queue (which can now query a non-empty storage).
             self.cache_controller.handle_backup_operation()
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
             # Log storage state every 50 calls (to avoid log spam)
