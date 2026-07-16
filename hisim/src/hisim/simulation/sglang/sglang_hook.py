@@ -631,6 +631,14 @@ class C_HiCacheController(BaseHook):
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
 
+            # Diagnostic: log prefetch queue status periodically
+            _prefetch_qsize = self.prefetch_queue.qsize() if hasattr(self, 'prefetch_queue') else -1
+            if _prefetch_qsize > 0:
+                logger.info(
+                    f"[PrefetchHandle] queue_size={_prefetch_qsize} "
+                    f"remain_dur={remain_dur:.4f} threshold={self.prefetch_threshold}"
+                )
+
             chunked_prefetch_operation = getattr(
                 self, "chunked_prefetch_operation", None
             )
@@ -1064,19 +1072,37 @@ class C_HiRadixCacheHook(BaseHook):
             last_host_node = last_node
             # Walk up from last_node, computing host_hit_length.
             # Skip nodes with host_value=None (soft-evicted from Host).
+            _evicted_ancestor_count = 0
+            _backuped_evicted_count = 0
             while last_node.evicted:
+                _evicted_ancestor_count += 1
                 if last_node.host_value is not None:
                     host_hit_length += len(last_node.host_value)
                 else:
                     # Soft-evicted: host data freed, skip in host_hit_length.
                     # Still continue walking up to find ancestor nodes with host data.
                     pass
+                if last_node.backuped:
+                    _backuped_evicted_count += 1
                 last_node = last_node.parent
 
             # Find last_host_node: walk up until we find a backuped node.
             # For soft-evicted nodes (host_value=None), backuped=False, so they're skipped.
+            _walk_up_count = 0
             while not last_host_node.backuped and last_host_node != self.root_node:
                 last_host_node = last_host_node.parent
+                _walk_up_count += 1
+
+            # Diagnostic: log when storage prefetch should trigger
+            is_root = last_host_node is self.root_node
+            if host_hit_length > 0 and not last_host_node.backuped and is_root:
+                # This case means we found host data but no backuped node →
+                # storage prefetch won't trigger from _prefetch_kvcache
+                logger.info(
+                    f"[Match] host_hit={host_hit_length} but last_host_node=root "
+                    f"(no backuped ancestor). evicted_ancestors={_evicted_ancestor_count} "
+                    f"backuped_evicted={_backuped_evicted_count} walk_up={_walk_up_count}"
+                )
 
             from sglang.srt.mem_cache.base_prefix_cache import MatchResult
             return MatchResult(
@@ -1474,10 +1500,26 @@ class C_HiRadixCacheHook(BaseHook):
                 last_node,
             )
 
+        _hicache_event_count = 0
         def wrapped_check_hicache_events(self, *args, **kwargs):
+            nonlocal _hicache_event_count
+            _hicache_event_count += 1
             # Call operation handler first.
             self.cache_controller.handle_backup_operation()
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
+            # Log storage state every 50 calls (to avoid log spam)
+            if _hicache_event_count % 50 == 0:
+                if hasattr(self.cache_controller, 'storage_backend') and self.cache_controller.storage_backend is not None:
+                    sb = self.cache_controller.storage_backend
+                    if hasattr(sb, 'storage'):
+                        logger.info(
+                            f"[Hicache] storage_keys=%d prefetch_queue=%d "
+                            f"backup_queue=%d" % (
+                                len(sb.storage),
+                                self.cache_controller.prefetch_queue.qsize() if hasattr(self.cache_controller, 'prefetch_queue') else -1,
+                                self.cache_controller.backup_queue.qsize() if hasattr(self.cache_controller, 'backup_queue') else -1,
+                            )
+                        )
             return original_check_hicache_events(self, *args, **kwargs)
 
         target.__init__ = override_init
@@ -2697,6 +2739,63 @@ class C_SchedulerHook(BaseHook):
 
             return ProfileReqOutput(True, json.dumps(result))
 
+        original_prefetch_kvcache = target._prefetch_kvcache
+
+        def wrapped_prefetch_kvcache(self, req):
+            """Hook _prefetch_kvcache to add diagnostic logging for L3 prefetch.
+
+            The original _prefetch_kvcache flow:
+            1. req.init_next_round_input(self.tree_cache) — calls match_prefix
+            2. Check last_host_node.backuped or last_host_node is root_node
+            3. Call prefetch_from_storage if condition met
+
+            Diagnostics: log the condition result to identify why L3=0%.
+            """
+            if not self.enable_hicache_storage:
+                # Storage not enabled, use original flow
+                original_prefetch_kvcache(self, req)
+                return
+
+            # Storage is enabled — replicate original flow with logging
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            last_host_node = req.last_host_node
+            is_root = last_host_node is self.tree_cache.root_node
+            is_backuped = last_host_node.backuped if not is_root else False
+            host_hit_len = req.host_hit_length
+            prefix_len = len(req.prefix_indices)
+            matched_len = prefix_len + host_hit_len
+            new_input_len = len(req.full_untruncated_fill_ids) - matched_len if hasattr(req, 'full_untruncated_fill_ids') else 0
+
+            if is_root or is_backuped:
+                last_hash = last_host_node.get_last_hash_value()
+                new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
+                prefix_keys = (
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    else None
+                )
+                self.tree_cache.prefetch_from_storage(
+                    req.rid,
+                    last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
+                )
+                logger.info(
+                    f"[Prefetch] rid={req.rid[:8]} TRIGGERED: "
+                    f"backuped={is_backuped} is_root={is_root} "
+                    f"prefix={prefix_len} host_hit={host_hit_len} "
+                    f"new_tokens={new_input_len} "
+                    f"prefetch_queue_size={self.tree_cache.cache_controller.prefetch_queue.qsize()}"
+                )
+            else:
+                logger.info(
+                    f"[Prefetch] rid={req.rid[:8]} SKIPPED: "
+                    f"backuped={is_backuped} is_root={is_root} "
+                    f"prefix={prefix_len} host_hit={host_hit_len} "
+                    f"new_tokens={new_input_len}"
+                )
+
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.recv_requests = wrapped_recv_requests
@@ -2704,6 +2803,7 @@ class C_SchedulerHook(BaseHook):
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
         target.profile = wrapped_profile
+        target._prefetch_kvcache = wrapped_prefetch_kvcache
         return target
 
 
