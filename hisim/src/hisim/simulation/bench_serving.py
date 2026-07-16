@@ -1737,19 +1737,58 @@ def sample_hisim_collection_requests(
             # JSONL format - each line is a JSON object
             raw_input_requests = [json.loads(line) for line in f if line.strip()]
 
-    if len(raw_input_requests) < num_requests:
-        print(
-            f"The required number prompts is less than data size({len(raw_input_requests)})"
-        )
-        num_requests = len(raw_input_requests)
-
-    input_requests = []
-    min_timestamp = float("inf")
     # (deprecated) created_time has been replaced with timestamp
     timestamp_field_name = (
         "created_time" if "created_time" in raw_input_requests[0] else "timestamp"
     )
-    for idx in range(num_requests):
+
+    # Session-aware sampling: when the dataset has session_id, select entire sessions
+    # rather than individual requests. This ensures intra-session prefix reuse is
+    # preserved. Without this, taking the first N entries from a timestamp-ordered
+    # file would yield 1 request per session (all round-0 requests), making
+    # intra-session cache hits impossible.
+    _has_session_id = any("session_id" in item for item in raw_input_requests[:100])
+    if _has_session_id:
+        # Group entries by session_id, preserving first-appearance order
+        session_groups: dict[str, list[int]] = defaultdict(list)
+        session_order = []
+        for idx, item in enumerate(raw_input_requests):
+            sid = item.get("session_id")
+            if sid is None:
+                sid = f"__no_session_{idx}"
+            if sid not in session_groups:
+                session_order.append(sid)
+            session_groups[sid].append(idx)
+
+        # Select sessions one by one until we reach num_requests
+        # Truncate the last session if it would exceed num_requests
+        selected_indices = []
+        for sid in session_order:
+            if len(selected_indices) >= num_requests:
+                break
+            remaining = num_requests - len(selected_indices)
+            group_indices = session_groups[sid]
+            selected_indices.extend(group_indices[:remaining])
+
+        num_selected_sessions = len(set(
+            raw_input_requests[i].get("session_id") for i in selected_indices
+        ))
+        print(
+            f"Session-aware sampling: selected {len(selected_indices)} requests "
+            f"from {num_selected_sessions} sessions (truncated to {num_requests})"
+        )
+    else:
+        # No session_id in dataset: fall back to sequential sampling
+        if len(raw_input_requests) < num_requests:
+            print(
+                f"The required number prompts is less than data size({len(raw_input_requests)})"
+            )
+            num_requests = len(raw_input_requests)
+        selected_indices = list(range(num_requests))
+
+    input_requests = []
+    min_timestamp = float("inf")
+    for idx in selected_indices:
         item = raw_input_requests[idx]
         # Calculate input_length if not present (for JSONL datasets with only input_ids)
         if "input_length" in item:
