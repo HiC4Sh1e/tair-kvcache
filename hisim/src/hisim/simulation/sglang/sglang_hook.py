@@ -1510,37 +1510,124 @@ class C_HiRadixCacheHook(BaseHook):
                 last_node,
             )
 
+        def sim_writing_check(self, write_back=False):
+            """Simulation-specific writing_check that bypasses CUDA event sync.
+
+            The real writing_check() relies on finish_event.query() to check
+            GPU→Host DMA completion, and _all_reduce() for TP/PP synchronization.
+            In HiSim simulation, there is no real GPU, so CUDA events never
+            report completion and _all_reduce would hang or crash.
+
+            This override treats ALL ack_write_queue entries as immediately
+            completed, directly calling _finish_write_through_ack for each.
+            This ensures the write-through pipeline (Device→Host→Storage)
+            progresses correctly in simulation.
+            """
+            if write_back:
+                # Blocking mode: process all pending writes
+                while len(self.ongoing_write_through) > 0:
+                    for _, _finish_event, ack_list in self.cache_controller.ack_write_queue:
+                        for ack_id in ack_list:
+                            self._finish_write_through_ack(ack_id, release_lock=False)
+                    self.cache_controller.ack_write_queue.clear()
+                return
+
+            # Non-blocking mode: process all completed writes
+            # In simulation, ALL writes are "completed" immediately (no real GPU DMA)
+            if len(self.ongoing_write_through) == 0:
+                return
+
+            finish_count = len(self.cache_controller.ack_write_queue)
+            if finish_count == 0:
+                return
+
+            while finish_count > 0:
+                _, _finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+                for ack_id in ack_list:
+                    self._finish_write_through_ack(ack_id, release_lock=True)
+                finish_count -= 1
+
+        def sim_loading_check(self):
+            """Simulation-specific loading_check that bypasses CUDA event sync.
+
+            Same rationale as sim_writing_check: the real loading_check uses
+            finish_event.query() and _all_reduce() which don't work in simulation.
+            """
+            if len(self.ongoing_load_back) == 0:
+                return
+
+            finish_count = len(self.cache_controller.ack_load_queue)
+            if finish_count == 0:
+                return
+
+            while finish_count > 0:
+                _, _finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+                for ack_id in ack_list:
+                    end_node = self.ongoing_load_back.pop(ack_id)
+                    self.dec_lock_ref(end_node)
+                finish_count -= 1
+
+        def sim_is_load_back_event_done(self, consumer_index: int) -> bool:
+            """Simulation-specific is_load_back_event_done that bypasses CUDA event check.
+
+            The real version checks finish_event.query() which never returns True
+            in simulation. In simulation, all load-back operations are considered
+            immediately complete.
+            """
+            if consumer_index < 0:
+                return True
+            # In simulation, load-back is always "done" immediately
+            sim_loading_check(self)
+            return True
+
         _hicache_event_count = 0
+        _last_storage_keys = -1
         def wrapped_check_hicache_events(self, *args, **kwargs):
-            nonlocal _hicache_event_count
+            nonlocal _hicache_event_count, _last_storage_keys
             _hicache_event_count += 1
             # CRITICAL: Process completed write-through operations FIRST.
-            # writing_check() drains ack_write_queue → _finish_write_through_ack
+            # sim_writing_check() drains ack_write_queue → _finish_write_through_ack
             # → write_backup_storage → backup_queue.put. Without this, the
             # backup_queue is empty when handle_backup_operation runs, and
             # storage (L3) never gets populated before prefetch queries it.
-            self.writing_check()
+            #
+            # We use sim_writing_check (not the real writing_check) because
+            # the real one uses CUDA event.query() and torch.distributed
+            # operations that don't work in simulation.
+            sim_writing_check(self)
             # Now process backup_queue (which was just filled by writing_check)
             # and prefetch_queue (which can now query a non-empty storage).
             self.cache_controller.handle_backup_operation()
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
-            # Log storage state every 50 calls (to avoid log spam)
-            if _hicache_event_count % 50 == 0:
+            # Log storage state every 200 calls, but only when values change
+            if _hicache_event_count % 200 == 0:
                 if hasattr(self.cache_controller, 'storage_backend') and self.cache_controller.storage_backend is not None:
                     sb = self.cache_controller.storage_backend
                     if hasattr(sb, 'storage'):
-                        logger.info(
-                            f"[Hicache] storage_keys=%d prefetch_queue=%d "
-                            f"backup_queue=%d" % (
-                                len(sb.storage),
-                                self.cache_controller.prefetch_queue.qsize() if hasattr(self.cache_controller, 'prefetch_queue') else -1,
-                                self.cache_controller.backup_queue.qsize() if hasattr(self.cache_controller, 'backup_queue') else -1,
+                        _sk = len(sb.storage)
+                        _pq = self.cache_controller.prefetch_queue.qsize() if hasattr(self.cache_controller, 'prefetch_queue') else -1
+                        _bq = self.cache_controller.backup_queue.qsize() if hasattr(self.cache_controller, 'backup_queue') else -1
+                        if _sk != _last_storage_keys or _pq > 0 or _bq > 0:
+                            _last_storage_keys = _sk
+                            logger.info(
+                                f"[Hicache] storage_keys={_sk} prefetch_queue={_pq} "
+                                f"backup_queue={_bq}"
                             )
-                        )
+            # Call original check_hicache_events which also calls
+            # self.writing_check() and self.loading_check() internally.
+            # Since we've replaced those methods below, they will use
+            # simulation-safe versions that bypass CUDA/distributed sync.
             return original_check_hicache_events(self, *args, **kwargs)
 
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
+        # Override writing_check and loading_check with simulation-safe versions.
+        # The originals use CUDA event.query() and torch.distributed._all_reduce()
+        # which hang or crash in simulation. The simulation versions treat all
+        # pending DMA operations as immediately completed.
+        target.writing_check = sim_writing_check
+        target.loading_check = sim_loading_check
+        target.is_load_back_event_done = sim_is_load_back_event_done
         target.reset = wrapped_reset
         target.evict = wrapped_evict
         target.evict_host = wrapped_evict_host
