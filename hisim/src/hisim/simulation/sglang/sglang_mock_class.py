@@ -1177,12 +1177,6 @@ class MockHiCacheStorage:
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        from hisim.utils import get_logger
-        _logger = get_logger("hisim")
-        _logger.info(
-            f"[Storage] batch_set: {len(keys)} keys, "
-            f"storage_size_before={len(self.storage) if hasattr(self, 'storage') else 'N/A'}"
-        )
         if hasattr(self, "storage_manager"):
             if extra_info and extra_info.prefix_keys is not None:
                 complete_prefix_hashs = extra_info.prefix_keys + keys
@@ -1218,8 +1212,6 @@ class MockHiCacheStorage:
         return the number of consecutive existing keys from the start.
         Can be overridden by subclasses for more efficient implementation.
         """
-        from hisim.utils import get_logger
-        _logger = get_logger("hisim")
         if hasattr(self, "storage_manager"):
             int_hash_keys = [_pass_str_to_block_ids(key) for key in keys]
             # Call the kvcm interface to match L3 prefix
@@ -1243,10 +1235,6 @@ class MockHiCacheStorage:
                 if not self.exists(keys[i]):
                     break
                 hit_count += 1
-            _logger.info(
-                f"[Storage] batch_exists: {len(keys)} keys queried, "
-                f"hit={hit_count} storage_total={len(self.storage)}"
-            )
             return hit_count
 
     def clear(self) -> bool:

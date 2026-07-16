@@ -631,14 +631,6 @@ class C_HiCacheController(BaseHook):
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
 
-            # Diagnostic: log prefetch queue status periodically
-            _prefetch_qsize = self.prefetch_queue.qsize() if hasattr(self, 'prefetch_queue') else -1
-            if _prefetch_qsize > 0:
-                logger.info(
-                    f"[PrefetchHandle] queue_size={_prefetch_qsize} "
-                    f"remain_dur={remain_dur:.4f} threshold={self.prefetch_threshold}"
-                )
-
             chunked_prefetch_operation = getattr(
                 self, "chunked_prefetch_operation", None
             )
@@ -1072,37 +1064,19 @@ class C_HiRadixCacheHook(BaseHook):
             last_host_node = last_node
             # Walk up from last_node, computing host_hit_length.
             # Skip nodes with host_value=None (soft-evicted from Host).
-            _evicted_ancestor_count = 0
-            _backuped_evicted_count = 0
             while last_node.evicted:
-                _evicted_ancestor_count += 1
                 if last_node.host_value is not None:
                     host_hit_length += len(last_node.host_value)
                 else:
                     # Soft-evicted: host data freed, skip in host_hit_length.
                     # Still continue walking up to find ancestor nodes with host data.
                     pass
-                if last_node.backuped:
-                    _backuped_evicted_count += 1
                 last_node = last_node.parent
 
             # Find last_host_node: walk up until we find a backuped node.
             # For soft-evicted nodes (host_value=None), backuped=False, so they're skipped.
-            _walk_up_count = 0
             while not last_host_node.backuped and last_host_node != self.root_node:
                 last_host_node = last_host_node.parent
-                _walk_up_count += 1
-
-            # Diagnostic: log when storage prefetch should trigger
-            is_root = last_host_node is self.root_node
-            if host_hit_length > 0 and not last_host_node.backuped and is_root:
-                # This case means we found host data but no backuped node →
-                # storage prefetch won't trigger from _prefetch_kvcache
-                logger.info(
-                    f"[Match] host_hit={host_hit_length} but last_host_node=root "
-                    f"(no backuped ancestor). evicted_ancestors={_evicted_ancestor_count} "
-                    f"backuped_evicted={_backuped_evicted_count} walk_up={_walk_up_count}"
-                )
 
             from sglang.srt.mem_cache.base_prefix_cache import MatchResult
             return MatchResult(
@@ -1377,11 +1351,6 @@ class C_HiRadixCacheHook(BaseHook):
             ancester_node = node  # First non-evicted ancestor
 
             if not nodes_to_load:
-                # All evicted ancestors are soft-evicted (no host data available).
-                # Nothing to load back — return None.
-                logger.debug(
-                    f"[LoadBack] No nodes with host data to load for node_id={last_hit_node.id}"
-                )
                 return None
 
             # Protect the ancestor nodes from eviction
@@ -1397,10 +1366,6 @@ class C_HiRadixCacheHook(BaseHook):
                     validated_nodes.append(n)
                     # Protect from host eviction during load_back
                     n.host_ref_counter += 1
-                else:
-                    logger.debug(
-                        f"[LoadBack] Node {n.id} lost host_value during load_back setup, skipping"
-                    )
 
             if not validated_nodes:
                 self.dec_lock_ref(ancester_node)
@@ -1423,14 +1388,6 @@ class C_HiRadixCacheHook(BaseHook):
             )
             if device_indices is None:
                 self.evict(EvictParams(num_tokens=len(host_indices)))
-                # Diagnostic: check allocator state after eviction
-                _alloc_free_pages = len(self.cache_controller.mem_pool_device_allocator.free_pages)
-                _need_pages = (len(host_indices) + self.page_size - 1) // self.page_size
-                logger.info(
-                    f"[LoadBack] After eviction: allocator_free_pages={_alloc_free_pages} "
-                    f"need_pages={_need_pages} need_tokens={len(host_indices)} "
-                    f"page_size={self.page_size}"
-                )
                 device_indices = self.cache_controller.load(
                     host_indices=host_indices,
                     node_id=last_hit_node.id,
@@ -1438,14 +1395,12 @@ class C_HiRadixCacheHook(BaseHook):
                 )
             self.dec_lock_ref(ancester_node)
             if device_indices is None:
-                _alloc_free_pages = len(self.cache_controller.mem_pool_device_allocator.free_pages)
                 logger.warning(
                     "load_back: FAILED to load %d tokens for node %d "
-                    "even after eviction (evictable_size=%d, free_pages=%d)",
+                    "even after eviction (evictable_size=%d)",
                     len(host_indices),
                     last_hit_node.id,
                     self.evictable_size_,
-                    _alloc_free_pages,
                 )
                 for n in validated_nodes:
                     n.host_ref_counter -= 1
@@ -1459,9 +1414,6 @@ class C_HiRadixCacheHook(BaseHook):
                     # Skip this node — we can't restore what isn't there.
                     # Still need to release host eviction protection.
                     n.host_ref_counter -= 1
-                    logger.debug(
-                        f"[LoadBack] Node {n.id} host_value became None during load, skipping value assignment"
-                    )
                     continue
                 hv_len = len(n.host_value)
                 n.value = device_indices[offset : offset + hv_len].clone()
@@ -1510,124 +1462,14 @@ class C_HiRadixCacheHook(BaseHook):
                 last_node,
             )
 
-        def sim_writing_check(self, write_back=False):
-            """Simulation-specific writing_check that bypasses CUDA event sync.
-
-            The real writing_check() relies on finish_event.query() to check
-            GPU→Host DMA completion, and _all_reduce() for TP/PP synchronization.
-            In HiSim simulation, there is no real GPU, so CUDA events never
-            report completion and _all_reduce would hang or crash.
-
-            This override treats ALL ack_write_queue entries as immediately
-            completed, directly calling _finish_write_through_ack for each.
-            This ensures the write-through pipeline (Device→Host→Storage)
-            progresses correctly in simulation.
-            """
-            if write_back:
-                # Blocking mode: process all pending writes
-                while len(self.ongoing_write_through) > 0:
-                    for _, _finish_event, ack_list in self.cache_controller.ack_write_queue:
-                        for ack_id in ack_list:
-                            self._finish_write_through_ack(ack_id, release_lock=False)
-                    self.cache_controller.ack_write_queue.clear()
-                return
-
-            # Non-blocking mode: process all completed writes
-            # In simulation, ALL writes are "completed" immediately (no real GPU DMA)
-            if len(self.ongoing_write_through) == 0:
-                return
-
-            finish_count = len(self.cache_controller.ack_write_queue)
-            if finish_count == 0:
-                return
-
-            while finish_count > 0:
-                _, _finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-                for ack_id in ack_list:
-                    self._finish_write_through_ack(ack_id, release_lock=True)
-                finish_count -= 1
-
-        def sim_loading_check(self):
-            """Simulation-specific loading_check that bypasses CUDA event sync.
-
-            Same rationale as sim_writing_check: the real loading_check uses
-            finish_event.query() and _all_reduce() which don't work in simulation.
-            """
-            if len(self.ongoing_load_back) == 0:
-                return
-
-            finish_count = len(self.cache_controller.ack_load_queue)
-            if finish_count == 0:
-                return
-
-            while finish_count > 0:
-                _, _finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-                for ack_id in ack_list:
-                    end_node = self.ongoing_load_back.pop(ack_id)
-                    self.dec_lock_ref(end_node)
-                finish_count -= 1
-
-        def sim_is_load_back_event_done(self, consumer_index: int) -> bool:
-            """Simulation-specific is_load_back_event_done that bypasses CUDA event check.
-
-            The real version checks finish_event.query() which never returns True
-            in simulation. In simulation, all load-back operations are considered
-            immediately complete.
-            """
-            if consumer_index < 0:
-                return True
-            # In simulation, load-back is always "done" immediately
-            sim_loading_check(self)
-            return True
-
-        _hicache_event_count = 0
-        _last_storage_keys = -1
         def wrapped_check_hicache_events(self, *args, **kwargs):
-            nonlocal _hicache_event_count, _last_storage_keys
-            _hicache_event_count += 1
-            # CRITICAL: Process completed write-through operations FIRST.
-            # sim_writing_check() drains ack_write_queue → _finish_write_through_ack
-            # → write_backup_storage → backup_queue.put. Without this, the
-            # backup_queue is empty when handle_backup_operation runs, and
-            # storage (L3) never gets populated before prefetch queries it.
-            #
-            # We use sim_writing_check (not the real writing_check) because
-            # the real one uses CUDA event.query() and torch.distributed
-            # operations that don't work in simulation.
-            sim_writing_check(self)
-            # Now process backup_queue (which was just filled by writing_check)
-            # and prefetch_queue (which can now query a non-empty storage).
+            # Call operation handler first.
             self.cache_controller.handle_backup_operation()
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
-            # Log storage state every 200 calls, but only when values change
-            if _hicache_event_count % 200 == 0:
-                if hasattr(self.cache_controller, 'storage_backend') and self.cache_controller.storage_backend is not None:
-                    sb = self.cache_controller.storage_backend
-                    if hasattr(sb, 'storage'):
-                        _sk = len(sb.storage)
-                        _pq = self.cache_controller.prefetch_queue.qsize() if hasattr(self.cache_controller, 'prefetch_queue') else -1
-                        _bq = self.cache_controller.backup_queue.qsize() if hasattr(self.cache_controller, 'backup_queue') else -1
-                        if _sk != _last_storage_keys or _pq > 0 or _bq > 0:
-                            _last_storage_keys = _sk
-                            logger.info(
-                                f"[Hicache] storage_keys={_sk} prefetch_queue={_pq} "
-                                f"backup_queue={_bq}"
-                            )
-            # Call original check_hicache_events which also calls
-            # self.writing_check() and self.loading_check() internally.
-            # Since we've replaced those methods below, they will use
-            # simulation-safe versions that bypass CUDA/distributed sync.
             return original_check_hicache_events(self, *args, **kwargs)
 
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
-        # Override writing_check and loading_check with simulation-safe versions.
-        # The originals use CUDA event.query() and torch.distributed._all_reduce()
-        # which hang or crash in simulation. The simulation versions treat all
-        # pending DMA operations as immediately completed.
-        target.writing_check = sim_writing_check
-        target.loading_check = sim_loading_check
-        target.is_load_back_event_done = sim_is_load_back_event_done
         target.reset = wrapped_reset
         target.evict = wrapped_evict
         target.evict_host = wrapped_evict_host
@@ -2843,63 +2685,6 @@ class C_SchedulerHook(BaseHook):
 
             return ProfileReqOutput(True, json.dumps(result))
 
-        original_prefetch_kvcache = target._prefetch_kvcache
-
-        def wrapped_prefetch_kvcache(self, req):
-            """Hook _prefetch_kvcache to add diagnostic logging for L3 prefetch.
-
-            The original _prefetch_kvcache flow:
-            1. req.init_next_round_input(self.tree_cache) — calls match_prefix
-            2. Check last_host_node.backuped or last_host_node is root_node
-            3. Call prefetch_from_storage if condition met
-
-            Diagnostics: log the condition result to identify why L3=0%.
-            """
-            if not self.enable_hicache_storage:
-                # Storage not enabled, use original flow
-                original_prefetch_kvcache(self, req)
-                return
-
-            # Storage is enabled — replicate original flow with logging
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            is_root = last_host_node is self.tree_cache.root_node
-            is_backuped = last_host_node.backuped if not is_root else False
-            host_hit_len = req.host_hit_length
-            prefix_len = len(req.prefix_indices)
-            matched_len = prefix_len + host_hit_len
-            new_input_len = len(req.full_untruncated_fill_ids) - matched_len if hasattr(req, 'full_untruncated_fill_ids') else 0
-
-            if is_root or is_backuped:
-                last_hash = last_host_node.get_last_hash_value()
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
-                prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
-                )
-                self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
-                logger.info(
-                    f"[Prefetch] rid={req.rid[:8]} TRIGGERED: "
-                    f"backuped={is_backuped} is_root={is_root} "
-                    f"prefix={prefix_len} host_hit={host_hit_len} "
-                    f"new_tokens={new_input_len} "
-                    f"prefetch_queue_size={self.tree_cache.cache_controller.prefetch_queue.qsize()}"
-                )
-            else:
-                logger.info(
-                    f"[Prefetch] rid={req.rid[:8]} SKIPPED: "
-                    f"backuped={is_backuped} is_root={is_root} "
-                    f"prefix={prefix_len} host_hit={host_hit_len} "
-                    f"new_tokens={new_input_len}"
-                )
-
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.recv_requests = wrapped_recv_requests
@@ -2907,7 +2692,6 @@ class C_SchedulerHook(BaseHook):
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
         target.profile = wrapped_profile
-        target._prefetch_kvcache = wrapped_prefetch_kvcache
         return target
 
 
