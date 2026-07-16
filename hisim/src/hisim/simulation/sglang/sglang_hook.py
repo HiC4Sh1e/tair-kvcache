@@ -772,6 +772,10 @@ class C_HiRadixCacheHook(BaseHook):
 
         def wrapped_reset(self):
             if hasattr(self, "cache_controller"):
+                # Drain pending write-through acks first so that
+                # write_backup_storage populates backup_queue before
+                # handle_backup_operation runs.
+                self.writing_check()
                 self.cache_controller.handle_backup_operation()
             original_reset(self)
 
@@ -1465,13 +1469,115 @@ class C_HiRadixCacheHook(BaseHook):
             )
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
-            # Call operation handler first.
+            # Order matters in simulation:
+            # 1. sim_writing_check drains ack_write_queue and calls
+            #    _finish_write_through_ack -> write_backup_storage -> populates
+            #    backup_queue. Without this, backup_queue is empty and
+            #    handle_backup_operation() has nothing to process.
+            # 2. handle_backup_operation drains backup_queue and calls
+            #    _page_backup -> batch_set, putting data into storage.
+            # 3. handle_prefetch_operation drains prefetch_queue and queries
+            #    storage (batch_exists) to compute storage hits.
+            # 4. original_check_hicache_events runs the rest (storage control
+            #    queues, async work reaping). It internally calls
+            #    self.writing_check() / self.loading_check(), which are now
+            #    overridden to sim_* versions (no-op if queues already drained).
+            self.writing_check()
             self.cache_controller.handle_backup_operation()
             self.cache_controller.handle_prefetch_operation(hiradix_cache=self)
             return original_check_hicache_events(self, *args, **kwargs)
 
+        def sim_writing_check(self, write_back=False):
+            """Simulation-safe version of writing_check.
+
+            The original writing_check uses finish_event.synchronize() and
+            _all_reduce() (torch.distributed) to confirm DMA completion.
+            In CPU simulation there is no real GPU DMA, so CUDA events never
+            report completion (or behave as no-ops), which causes the write
+            queue to stall — `ongoing_write_through` is never drained, and
+            `lock_ref` is never decremented via `_finish_write_through_ack`.
+            Locked nodes cannot be evicted, and their host data is never
+            published to storage via `write_backup_storage`.
+
+            This simulation version treats ALL pending DMA operations as
+            immediately completed. It drains `ack_write_queue` and calls
+            `_finish_write_through_ack` for each ack without touching CUDA
+            events or distributed sync.
+            """
+            if write_back:
+                # Drain all pending write-through acks (blocking mode).
+                # In simulation, every write_backup() call appends one ack to
+                # ack_write_queue via start_writing(), so ongoing_write_through
+                # and ack_write_queue should drain together. The guard prevents
+                # an infinite loop if the invariant ever breaks.
+                safety_iters = 0
+                while len(self.ongoing_write_through) > 0 and safety_iters < 100:
+                    safety_iters += 1
+                    if len(self.cache_controller.ack_write_queue) == 0:
+                        break
+                    for _, _finish_event, ack_list in self.cache_controller.ack_write_queue:
+                        for ack_id in ack_list:
+                            self._finish_write_through_ack(ack_id, release_lock=False)
+                    self.cache_controller.ack_write_queue.clear()
+                return
+
+            if len(self.ongoing_write_through) == 0:
+                return
+
+            # Non-blocking: drain all completed acks (treat all as completed)
+            finish_count = len(self.cache_controller.ack_write_queue)
+            if finish_count > 0:
+                logger.debug(f"[sim_writing_check] Process {finish_count} write back ops")
+            while finish_count > 0 and len(self.cache_controller.ack_write_queue) > 0:
+                _, _finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+                for ack_id in ack_list:
+                    self._finish_write_through_ack(ack_id, release_lock=True)
+                finish_count -= 1
+
+        def sim_loading_check(self):
+            """Simulation-safe version of loading_check.
+
+            The original loading_check uses finish_event.query() and _all_reduce()
+            to confirm load-back DMA completion. In CPU simulation, CUDA events
+            never report completion, so `ack_load_queue` is never drained and
+            `ongoing_load_back` entries never release their lock_ref.
+
+            This version treats all pending load operations as immediately
+            completed and drains `ack_load_queue` without touching CUDA events
+            or distributed sync.
+            """
+            if len(self.cache_controller.ack_load_queue) == 0:
+                return
+
+            finish_count = len(self.cache_controller.ack_load_queue)
+            if finish_count > 0:
+                logger.debug(f"[sim_loading_check] Process {finish_count} load ops")
+            while finish_count > 0 and len(self.cache_controller.ack_load_queue) > 0:
+                _, _finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+                for ack_id in ack_list:
+                    end_node = self.ongoing_load_back.pop(ack_id, None)
+                    if end_node is not None:
+                        self.dec_lock_ref(end_node)
+                finish_count -= 1
+
+        def sim_is_load_back_event_done(self, consumer_index: int) -> bool:
+            """Simulation-safe version of is_load_back_event_done.
+
+            Always returns True in simulation (DMA treated as instantly
+            complete). Also drains pending load acks via the overridden
+            self.loading_check() (which is sim_loading_check).
+            """
+            self.loading_check()
+            return True
+
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
+        # Override CUDA-event-dependent methods with simulation-safe versions.
+        # These are assigned at the class level so all HiRadixCache instances
+        # (including those created in subprocesses) use the simulation versions.
+        target.writing_check = sim_writing_check
+        target.loading_check = sim_loading_check
+        target.is_load_back_event_done = sim_is_load_back_event_done
         target.reset = wrapped_reset
         target.evict = wrapped_evict
         target.evict_host = wrapped_evict_host
