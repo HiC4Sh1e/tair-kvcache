@@ -1781,8 +1781,13 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             if node.value is not None:
                 total_freed += len(node.value)
                 node_value = node.value  # save reference for freeing after _delete_leaf
+                node_host_value = node.host_value  # save reference for L2 cleanup
                 tree_cache._delete_leaf(node)
                 tree_cache.token_to_kv_pool_allocator.free(node_value)
+                # Free L2 (host_value) for HiRadixCache
+                if is_hiradix and node_host_value is not None:
+                    tree_cache.cache_controller.evict_host(node_host_value)
+                    tree_cache._update_host_leaf_status(node.parent)
             else:
                 # Already evicted, just remove from tree
                 # Can't use _delete_leaf since it expects non-evicted nodes,
@@ -1796,6 +1801,10 @@ def _cleanup_session_kv(session_id: str, tree_cache):
                 tree_cache._update_leaf_status(node.parent)
                 if hasattr(tree_cache, '_update_host_leaf_status'):
                     tree_cache._update_host_leaf_status(node.parent)
+                # Free L2 (host_value) for HiRadixCache — evicted nodes may still have host data
+                if is_hiradix and getattr(node, 'host_value', None) is not None:
+                    tree_cache.cache_controller.evict_host(node.host_value)
+                    node.host_value = None
             _remove_node_ownership(node)
             NODE_MAP.pop(node.id, None)
         else:
