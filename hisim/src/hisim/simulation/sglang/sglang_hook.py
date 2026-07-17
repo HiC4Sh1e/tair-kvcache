@@ -769,6 +769,7 @@ class C_HiRadixCacheHook(BaseHook):
         original_evict = target.evict
         original_evict_host = target.evict_host
         original_match_prefix_helper = target._match_prefix_helper
+        original_write_backup_storage = target.write_backup_storage
 
         def wrapped_reset(self):
             if hasattr(self, "cache_controller"):
@@ -1577,6 +1578,26 @@ class C_HiRadixCacheHook(BaseHook):
             self.loading_check()
             return True
 
+        def wrapped_write_backup_storage(self, node, backup_len=None):
+            """Guard write_backup_storage against node.host_value being None.
+
+            In simulation, _cleanup_session_kv may evict a node's host_value
+            (set to None) while a write-through operation for that node is still
+            in ongoing_write_through. When _finish_write_through_ack later calls
+            write_backup_storage, node.host_value is None, which would cause
+            TypeError in _page_backup (host_indices=None).
+
+            Skip the storage backup if host_value is None — the data has already
+            been cleaned up by session-end eviction.
+            """
+            if getattr(node, 'host_value', None) is None:
+                logger.debug(
+                    f"[write_backup_storage] Skipping: node {node.id} "
+                    f"host_value is None (likely evicted by session-end cleanup)"
+                )
+                return
+            original_write_backup_storage(self, node, backup_len)
+
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
         # Override CUDA-event-dependent methods with simulation-safe versions.
@@ -1592,6 +1613,7 @@ class C_HiRadixCacheHook(BaseHook):
         target.init_load_back = wrapped_init_load_back
         target.match_prefix = wrapped_match_prefix
         target._match_prefix_helper = wrapped_match_prefix_helper
+        target.write_backup_storage = wrapped_write_backup_storage
         return target
 
 
@@ -1746,6 +1768,37 @@ def _cleanup_session_kv(session_id: str, tree_cache):
         # Skip if node already deleted from tree (parent.children was cleared)
         if node.parent is None or node not in node.parent.children.values():
             continue
+
+        # Check if node has pending write-through operations.
+        # Nodes with write_through_pending_id or lock_ref > 0 or host_ref_counter > 0
+        # have ongoing DMA/backup operations that require host_value to remain
+        # valid. Freeing host_value while a write_backup_storage operation is
+        # pending would cause TypeError in _page_backup (host_indices=None).
+        has_pending_write = (
+            getattr(node, 'write_through_pending_id', None) is not None
+            or getattr(node, 'lock_ref', 0) > 0
+            or getattr(node, 'host_ref_counter', 0) > 0
+        )
+
+        # Skip L2 (host_value) cleanup if node has pending write operations.
+        # We can still free L1 (node.value) since the data has already been
+        # copied to host by write_backup. But we must NOT set host_value=None
+        # or call evict_host(), and we must NOT remove the node from the tree
+        # (via _delete_leaf) since the write-through ack needs to access the node.
+        if has_pending_write:
+            # Only free L1 (device memory) — data is already on host
+            if node.value is not None:
+                val_len = len(node.value)
+                tree_cache.token_to_kv_pool_allocator.free(node.value)
+                node.value = None
+                node.evicted = True
+                tree_cache.evictable_size_ -= val_len
+                tree_cache._update_leaf_status(node)
+                tree_cache._update_leaf_status(node.parent)
+                total_freed += val_len
+            # Do NOT free host_value or remove from tree
+            continue
+
         # Skip if node has non-evicted children (not a leaf)
         if any(not c.evicted for c in node.children.values()):
             # Still has active children — just evict this node's value
