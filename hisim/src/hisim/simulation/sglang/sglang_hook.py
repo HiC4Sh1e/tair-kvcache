@@ -2292,6 +2292,30 @@ class C_SchedulerHook(BaseHook):
             return recv_reqs
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+            # CRITICAL FIX: Clamp evictable_size_ before scheduler admission control.
+            # In simulation, available_size() + evictable_size_ can exceed
+            # max_total_num_tokens due to mock allocator accounting errors
+            # (duplicate frees, double-counted load_back/dec_lock_ref increments,
+            # session-end cleanup imprecision). This inflates PrefillAdder.rem_total_tokens,
+            # causing the scheduler to over-admit requests → huge decode batch_size
+            # → inflated TPOT. Fix by clamping so available + evictable <= max_total.
+            try:
+                _avail = self.token_to_kv_pool_allocator.available_size()
+                _evict = self.tree_cache.evictable_size()
+                _max = self.max_total_num_tokens
+                _total_free = _avail + _evict
+                if _total_free > _max and _max > 0:
+                    _old_evict = _evict
+                    self.tree_cache.evictable_size_ = max(0, _max - _avail)
+                    logger.debug(
+                        f"[AdmissionFix] Clamped evictable_size_: "
+                        f"{_old_evict} -> {self.tree_cache.evictable_size_} "
+                        f"(available={_avail}, max={_max}, "
+                        f"total_free={_total_free} > max={_max})"
+                    )
+            except Exception:
+                pass
+
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
             now = time.time()
 
