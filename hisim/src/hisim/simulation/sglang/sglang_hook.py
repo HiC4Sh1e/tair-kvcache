@@ -871,6 +871,13 @@ class C_HiRadixCacheHook(BaseHook):
                 if x.lock_ref > 0:
                     continue
 
+                if x.evicted:
+                    # Node was already evicted (value=None) — skip it.
+                    # This can happen when _cleanup_session_kv sets value=None
+                    # without calling _update_leaf_status, leaving the node
+                    # in evictable_leaves with a stale state.
+                    continue
+
                 if not x.backuped:
                     # Try to write to Host first, regardless of write_policy.
                     # In write_through mode, nodes that haven't been hit enough
@@ -1744,14 +1751,22 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             # Still has active children — just evict this node's value
             # but don't remove from tree
             if node.value is not None:
+                val_len = len(node.value)
                 tree_cache.token_to_kv_pool_allocator.free(node.value)
                 node.value = None
-                # evicted is a property that returns value is None, so setting value=None makes evicted=True
-                total_freed += len(node.key) if hasattr(node, 'key') and node.key is not None else 0
+                # Update evictable_size_ and leaf status to keep tree invariants.
+                # Without this, evictable_leaves may contain this evicted node,
+                # causing write_backup(node) to crash (device_indices=None).
+                tree_cache.evictable_size_ -= val_len
+                tree_cache._update_leaf_status(node)
+                tree_cache._update_leaf_status(node.parent)
+                total_freed += val_len
             # Handle L2 (host_value) for HiRadixCache
             if is_hiradix and getattr(node, 'host_value', None) is not None:
                 tree_cache.cache_controller.evict_host(node.host_value)
                 node.host_value = None
+                tree_cache._update_host_leaf_status(node)
+                tree_cache._update_host_leaf_status(node.parent)
             continue
 
         # Leaf node (or all children are evicted) — can fully delete
@@ -1772,20 +1787,34 @@ def _cleanup_session_kv(session_id: str, tree_cache):
                 # Already evicted, just remove from tree
                 # Can't use _delete_leaf since it expects non-evicted nodes,
                 # so remove manually
+                if node in tree_cache.evictable_leaves:
+                    tree_cache.evictable_leaves.remove(node)
+                if hasattr(tree_cache, 'evictable_host_leaves') and node in tree_cache.evictable_host_leaves:
+                    tree_cache.evictable_host_leaves.remove(node)
                 key = node.key.child_key(tree_cache.page_size)
                 node.parent.children.pop(key, None)
+                tree_cache._update_leaf_status(node.parent)
+                if hasattr(tree_cache, '_update_host_leaf_status'):
+                    tree_cache._update_host_leaf_status(node.parent)
             _remove_node_ownership(node)
             NODE_MAP.pop(node.id, None)
         else:
             # Has evicted children — soft evict (set value=None)
             if node.value is not None:
-                total_freed += len(node.value)
+                val_len = len(node.value)
                 tree_cache.token_to_kv_pool_allocator.free(node.value)
                 node.value = None
+                # Update evictable_size_ and leaf status to keep tree invariants.
+                tree_cache.evictable_size_ -= val_len
+                tree_cache._update_leaf_status(node)
+                tree_cache._update_leaf_status(node.parent)
+                total_freed += val_len
             # Handle L2 (host_value) for HiRadixCache
             if is_hiradix and getattr(node, 'host_value', None) is not None:
                 tree_cache.cache_controller.evict_host(node.host_value)
                 node.host_value = None
+                tree_cache._update_host_leaf_status(node)
+                tree_cache._update_host_leaf_status(node.parent)
 
     # 4. Remove session TTL
     SESSION_TTL_TABLE.pop(session_id, None)
@@ -2338,6 +2367,42 @@ class C_SchedulerHook(BaseHook):
                         host_hit = getattr(req, 'host_hit_length', 0)
                         storage_hit = getattr(req, 'storage_hit_length', 0)
                         hit_pct = f"({total_hit / input_len:.1%} hit)" if input_len > 0 else ""
+
+                        # Cache space usage: L1 (HBM), L2 (Memory), L3 (Disk)
+                        _l1_used = 0; _l1_cap = 0
+                        _l2_used = 0; _l2_cap = 0
+                        _l3_keys = -1
+                        try:
+                            _alloc = self.token_to_kv_pool_allocator
+                            _l1_cap = getattr(_alloc, 'size', 0) or self.max_total_num_tokens
+                            _l1_used = _l1_cap - _alloc.available_size()
+                            if hasattr(self.tree_cache, 'cache_controller'):
+                                _cc = self.tree_cache.cache_controller
+                                if hasattr(_cc, 'mem_pool_host'):
+                                    _hp = _cc.mem_pool_host
+                                    _l2_cap = getattr(_hp, 'size', 0)
+                                    _l2_used = _l2_cap - _hp.available_size() if _l2_cap > 0 else 0
+                                if hasattr(_cc, 'hicache_storage'):
+                                    _st = _cc.hicache_storage
+                                    _l3_keys = len(getattr(_st, 'storage', set()))
+                        except Exception:
+                            pass
+
+                        def _fmt_tok(used, cap):
+                            """Format token count as usedK/capK (pct%)."""
+                            if cap <= 0:
+                                return ""
+                            def _k(n):
+                                return f"{n/1000:.0f}K" if n >= 1000 else f"{n}"
+                            pct = f" {used/cap:.0%}" if cap > 0 else ""
+                            return f"{_k(used)}/{_k(cap)}{pct}"
+
+                        _l1_str = f"L1={_fmt_tok(_l1_used, _l1_cap)}" if _l1_cap > 0 else ""
+                        _l2_str = f"L2={_fmt_tok(_l2_used, _l2_cap)}" if _l2_cap > 0 else ""
+                        _l3_str = f"L3_keys={_l3_keys}" if _l3_keys >= 0 else ""
+                        _space_parts = [s for s in [_l1_str, _l2_str, _l3_str] if s]
+                        _space_str = " ".join(_space_parts)
+
                         logger.info(
                             f"[Prefill] req={req.rid} input={input_len} "
                             f"L1(HBM)={device_portion} L2(Mem)={host_portion} "
@@ -2345,16 +2410,27 @@ class C_SchedulerHook(BaseHook):
                             f"cached_total={total_hit} {hit_pct} "
                             f"[raw: prefix_idx={prefix_len} host_hit={host_hit} "
                             f"storage_hit={storage_hit} "
-                            f"dev={raw_device} host={raw_host} disk={raw_storage}]"
+                            f"dev={raw_device} host={raw_host} disk={raw_storage}] "
+                            f"[space: {_space_str}]"
                         )
                     else:
                         # No HiCache — all cached tokens are L1 (HBM only)
                         req_stats.final_reused_tokens = min(req.cached_tokens, input_len)
                         miss_len = max(0, input_len - req.cached_tokens)
+                        # Cache space usage for non-HiCache path
+                        _l1_used = 0; _l1_cap = 0
+                        try:
+                            _alloc = self.token_to_kv_pool_allocator
+                            _l1_cap = getattr(_alloc, 'size', 0) or self.max_total_num_tokens
+                            _l1_used = _l1_cap - _alloc.available_size()
+                        except Exception:
+                            pass
+                        _l1_pct = f"{_l1_used/1000:.0f}K/{_l1_cap/1000:.0f}K {_l1_used/_l1_cap:.0%}" if _l1_cap > 0 else ""
                         logger.info(
                             f"[Prefill] req={req.rid} input={input_len} "
                             f"L1(HBM)={req.cached_tokens} miss={miss_len} "
-                            f"cached_total={req.cached_tokens}"
+                            f"cached_total={req.cached_tokens} "
+                            f"[space: L1={_l1_pct}]"
                         )
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
