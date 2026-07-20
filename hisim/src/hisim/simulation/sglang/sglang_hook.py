@@ -1791,7 +1791,8 @@ def _cleanup_session_kv(session_id: str, tree_cache):
                 val_len = len(node.value)
                 tree_cache.token_to_kv_pool_allocator.free(node.value)
                 node.value = None
-                node.evicted = True
+                # Note: node.evicted is a property (return self.value is None),
+                # so setting value=None automatically makes evicted=True.
                 tree_cache.evictable_size_ -= val_len
                 tree_cache._update_leaf_status(node)
                 tree_cache._update_leaf_status(node.parent)
