@@ -1789,7 +1789,12 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             # Only free L1 (device memory) — data is already on host
             if node.value is not None:
                 val_len = len(node.value)
-                tree_cache.token_to_kv_pool_allocator.free(node.value)
+                # Do NOT call token_to_kv_pool_allocator.free() in simulation.
+                # The mock allocator's free() doesn't validate indices,
+                # causing available_size() to inflate beyond max_total_num_tokens.
+                # This breaks admission control (evictable_size_ clamped to 0
+                # or negative, causing simulation to hang).
+                # Only update tree bookkeeping (value=None, evictable_size_).
                 node.value = None
                 # Note: node.evicted is a property (return self.value is None),
                 # so setting value=None automatically makes evicted=True.
@@ -1806,7 +1811,9 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             # but don't remove from tree
             if node.value is not None:
                 val_len = len(node.value)
-                tree_cache.token_to_kv_pool_allocator.free(node.value)
+                # Do NOT call token_to_kv_pool_allocator.free() in simulation.
+                # The mock allocator's free() doesn't validate indices,
+                # causing available_size() to inflate beyond max_total_num_tokens.
                 node.value = None
                 # Update evictable_size_ and leaf status to keep tree invariants.
                 # Without this, evictable_leaves may contain this evicted node,
@@ -1834,10 +1841,13 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             # so we must call it BEFORE freeing node.value
             if node.value is not None:
                 total_freed += len(node.value)
-                node_value = node.value  # save reference for freeing after _delete_leaf
+                node_value = node.value  # save reference for L1 size counting
                 node_host_value = node.host_value  # save reference for L2 cleanup
                 tree_cache._delete_leaf(node)
-                tree_cache.token_to_kv_pool_allocator.free(node_value)
+                # Do NOT call token_to_kv_pool_allocator.free() in simulation.
+                # The mock allocator's free() doesn't validate indices,
+                # causing available_size() to inflate beyond max_total_num_tokens.
+                # _delete_leaf already decremented evictable_size_ by len(node.key).
                 # Free L2 (host_value) for HiRadixCache
                 if is_hiradix and node_host_value is not None:
                     tree_cache.cache_controller.evict_host(node_host_value)
@@ -1865,7 +1875,9 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             # Has evicted children — soft evict (set value=None)
             if node.value is not None:
                 val_len = len(node.value)
-                tree_cache.token_to_kv_pool_allocator.free(node.value)
+                # Do NOT call token_to_kv_pool_allocator.free() in simulation.
+                # The mock allocator's free() doesn't validate indices,
+                # causing available_size() to inflate beyond max_total_num_tokens.
                 node.value = None
                 # Update evictable_size_ and leaf status to keep tree invariants.
                 tree_cache.evictable_size_ -= val_len
