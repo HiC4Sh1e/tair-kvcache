@@ -1817,7 +1817,12 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             if is_hiradix and getattr(node, 'host_value', None) is not None:
                 tree_cache.cache_controller.evict_host(node.host_value)
                 node.host_value = None
-                tree_cache._update_host_leaf_status(node)
+                # Remove from evictable_host_leaves BEFORE _update_host_leaf_status,
+                # because _update_host_leaf_status may re-add the node (it checks
+                # evicted + no backuped children, but doesn't check host_value).
+                # With host_value=None, the L2 evictor would crash on evict_host(None).
+                if hasattr(tree_cache, 'evictable_host_leaves') and node in tree_cache.evictable_host_leaves:
+                    tree_cache.evictable_host_leaves.remove(node)
                 tree_cache._update_host_leaf_status(node.parent)
             continue
 
@@ -1835,6 +1840,11 @@ def _cleanup_session_kv(session_id: str, tree_cache):
                 node_value = node.value  # save reference for freeing after _delete_leaf
                 node_host_value = node.host_value  # save reference for L2 cleanup
                 tree_cache._delete_leaf(node)
+                # _delete_leaf only removes from evictable_leaves (L1), not
+                # evictable_host_leaves (L2). Remove from L2 set to prevent
+                # the L2 evictor from picking up a deleted node.
+                if is_hiradix and hasattr(tree_cache, 'evictable_host_leaves') and node in tree_cache.evictable_host_leaves:
+                    tree_cache.evictable_host_leaves.remove(node)
                 # Free L1 device memory. The available_size() cap in the mock
                 # allocator prevents inflation beyond max_total_num_tokens.
                 tree_cache.token_to_kv_pool_allocator.free(node_value)
@@ -1878,7 +1888,11 @@ def _cleanup_session_kv(session_id: str, tree_cache):
             if is_hiradix and getattr(node, 'host_value', None) is not None:
                 tree_cache.cache_controller.evict_host(node.host_value)
                 node.host_value = None
-                tree_cache._update_host_leaf_status(node)
+                # Remove from evictable_host_leaves BEFORE _update_host_leaf_status,
+                # because _update_host_leaf_status may re-add the node (same issue
+                # as non-evicted children path: it doesn't check host_value).
+                if hasattr(tree_cache, 'evictable_host_leaves') and node in tree_cache.evictable_host_leaves:
+                    tree_cache.evictable_host_leaves.remove(node)
                 tree_cache._update_host_leaf_status(node.parent)
 
     # 4. Remove session TTL
