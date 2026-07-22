@@ -862,8 +862,21 @@ def get_dataset(args, tokenizer, model_id=None):
         with open(local_path, "r") as f:
             all_requests_data = [json.loads(line) for line in f if line.strip()]
 
-        # Limit the number of requests based on --num-prompts
-        input_requests = all_requests_data[: args.num_prompts]
+        # Limit the number of requests based on --num-prompts.
+        # If num_prompts exceeds the dataset size, loop back to the beginning.
+        total = len(all_requests_data)
+        if args.num_prompts <= total:
+            input_requests = all_requests_data[: args.num_prompts]
+        else:
+            full_passes = args.num_prompts // total
+            remainder = args.num_prompts % total
+            input_requests = all_requests_data * full_passes
+            if remainder > 0:
+                input_requests.extend(all_requests_data[:remainder])
+            print(
+                f"Dataset size({total}) < num_prompts({args.num_prompts}): "
+                f"looping {full_passes} full pass(es) + {remainder} extra request(s)"
+            )
     elif args.dataset_name == "hisim-collection":
         input_requests = sample_hisim_collection_requests(
             args.dataset_path, args.num_prompts, tokenizer=tokenizer
@@ -1760,31 +1773,54 @@ def sample_hisim_collection_requests(
                 session_order.append(sid)
             session_groups[sid].append(idx)
 
-        # Select sessions one by one until we reach num_requests
-        # Truncate the last session if it would exceed num_requests
+        # Select sessions one by one until we reach num_requests.
+        # If num_requests exceeds the total dataset size, loop back to the
+        # beginning and replay sessions (keeps session boundaries intact so
+        # intra-session prefix reuse still works on subsequent passes).
         selected_indices = []
-        for sid in session_order:
-            if len(selected_indices) >= num_requests:
-                break
-            remaining = num_requests - len(selected_indices)
-            group_indices = session_groups[sid]
-            selected_indices.extend(group_indices[:remaining])
+        if num_requests <= len(raw_input_requests):
+            # Single pass — truncate the last session if it would exceed
+            for sid in session_order:
+                if len(selected_indices) >= num_requests:
+                    break
+                remaining = num_requests - len(selected_indices)
+                group_indices = session_groups[sid]
+                selected_indices.extend(group_indices[:remaining])
+        else:
+            # Loop sessions until we reach num_requests. Only the final
+            # iteration may need to truncate the last session.
+            while len(selected_indices) < num_requests:
+                for sid in session_order:
+                    if len(selected_indices) >= num_requests:
+                        break
+                    remaining = num_requests - len(selected_indices)
+                    group_indices = session_groups[sid]
+                    selected_indices.extend(group_indices[:remaining])
 
         num_selected_sessions = len(set(
             raw_input_requests[i].get("session_id") for i in selected_indices
         ))
         print(
             f"Session-aware sampling: selected {len(selected_indices)} requests "
-            f"from {num_selected_sessions} sessions (truncated to {num_requests})"
+            f"from {num_selected_sessions} sessions "
+            f"(dataset size={len(raw_input_requests)}, target={num_requests})"
         )
     else:
-        # No session_id in dataset: fall back to sequential sampling
-        if len(raw_input_requests) < num_requests:
+        # No session_id in dataset: fall back to sequential sampling.
+        # If num_requests exceeds the dataset size, loop back to the beginning.
+        total = len(raw_input_requests)
+        if num_requests <= total:
+            selected_indices = list(range(num_requests))
+        else:
+            full_passes = num_requests // total
+            remainder = num_requests % total
+            selected_indices = list(range(total)) * full_passes
+            if remainder > 0:
+                selected_indices.extend(range(remainder))
             print(
-                f"The required number prompts is less than data size({len(raw_input_requests)})"
+                f"Dataset size({total}) < num_requests({num_requests}): "
+                f"looping {full_passes} full pass(es) + {remainder} extra request(s)"
             )
-            num_requests = len(raw_input_requests)
-        selected_indices = list(range(num_requests))
 
     input_requests = []
     min_timestamp = float("inf")
@@ -2980,6 +3016,41 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
+    # Expand request list by --num-rounds: repeat the selected request set
+    # n times with timestamp offsets per round so that round 2 starts after
+    # round 1 finishes when using trace timestamps.
+    # Note: Mooncake dataset uses dict format, not DatasetRow, and has its own
+    # --mooncake-num-rounds for multi-turn conversations. Skip here.
+    num_rounds = getattr(args, "num_rounds", 1)
+    if num_rounds > 1 and input_requests and args.dataset_name != "mooncake":
+        # Calculate the time span of one round for timestamp offset
+        timestamps = [r.timestamp for r in input_requests if r.timestamp is not None]
+        round_duration = (max(timestamps) - min(timestamps)) if timestamps else 0
+        # Add a small gap between rounds (1 second)
+        round_duration += 1.0
+
+        base_requests = input_requests
+        expanded = list(base_requests)  # round 0 (original timestamps)
+        for round_idx in range(1, num_rounds):
+            offset = round_duration * round_idx
+            for req in base_requests:
+                new_req = DatasetRow(
+                    prompt=req.prompt,
+                    prompt_len=req.prompt_len,
+                    output_len=req.output_len,
+                    text_prompt_len=req.text_prompt_len,
+                    vision_prompt_len=req.vision_prompt_len,
+                    image_data=req.image_data,
+                    timestamp=(req.timestamp + offset) if req.timestamp is not None else None,
+                    simulation=dict(req.simulation) if req.simulation else {},
+                )
+                expanded.append(new_req)
+        input_requests = expanded
+        print(
+            f"num_rounds={num_rounds}: expanded from {len(base_requests)} to "
+            f"{len(input_requests)} requests (round_duration={round_duration:.2f}s)"
+        )
+
     # Prepare LoRA arguments
     lora_request_distribution = (
         args.lora_request_distribution if args.lora_name is not None else None
@@ -3106,6 +3177,14 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Number of prompts to process. Default is 1000.",
+    )
+    parser.add_argument(
+        "--num-rounds",
+        type=int,
+        default=1,
+        help="Number of rounds to repeat the selected request set. "
+        "Requests are first sampled via --num-prompts, then sent this many times. "
+        "Total sent = num_prompts * num_rounds. Default is 1.",
     )
     parser.add_argument(
         "--sharegpt-output-len",
