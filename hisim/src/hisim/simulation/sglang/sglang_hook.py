@@ -1824,6 +1824,11 @@ def _cleanup_session_kv(session_id: str, tree_cache):
                 if hasattr(tree_cache, 'evictable_host_leaves') and node in tree_cache.evictable_host_leaves:
                     tree_cache.evictable_host_leaves.remove(node)
                 tree_cache._update_host_leaf_status(node.parent)
+                # _update_host_leaf_status may add parent to evictable_host_leaves
+                # even if parent.host_value is None (soft-evicted). Remove it to
+                # prevent the L2 evictor from crashing on evict_host(None).
+                if hasattr(tree_cache, 'evictable_host_leaves') and node.parent in tree_cache.evictable_host_leaves and getattr(node.parent, 'host_value', None) is None:
+                    tree_cache.evictable_host_leaves.remove(node.parent)
             continue
 
         # Leaf node (or all children are evicted) — can fully delete
@@ -1894,6 +1899,9 @@ def _cleanup_session_kv(session_id: str, tree_cache):
                 if hasattr(tree_cache, 'evictable_host_leaves') and node in tree_cache.evictable_host_leaves:
                     tree_cache.evictable_host_leaves.remove(node)
                 tree_cache._update_host_leaf_status(node.parent)
+                # Same guard as Path 2: parent may be added with host_value=None
+                if hasattr(tree_cache, 'evictable_host_leaves') and node.parent in tree_cache.evictable_host_leaves and getattr(node.parent, 'host_value', None) is None:
+                    tree_cache.evictable_host_leaves.remove(node.parent)
 
     # 4. Remove session TTL
     SESSION_TTL_TABLE.pop(session_id, None)
