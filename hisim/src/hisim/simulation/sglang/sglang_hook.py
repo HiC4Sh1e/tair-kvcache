@@ -1731,6 +1731,14 @@ def _cleanup_session_kv(session_id: str, tree_cache):
     if session_id is None:
         return
 
+    # DEBUG: Log evictable_size_ before cleanup
+    _evict_before = tree_cache.evictable_size() if hasattr(tree_cache, 'evictable_size') else 0
+    _avail_before = 0
+    try:
+        _avail_before = tree_cache.token_to_kv_pool_allocator.available_size()
+    except Exception:
+        pass
+
     # 1. Find exclusively-owned nodes and clean ownership
     exclusive_node_ids = []
     for node_id in list(NODE_OWNERS.keys()):
@@ -1911,10 +1919,37 @@ def _cleanup_session_kv(session_id: str, tree_cache):
         NODE_MAP.pop(nid, None)
 
     if total_freed > 0:
+        # DEBUG: Log evictable_size_ after cleanup
+        _evict_after = tree_cache.evictable_size() if hasattr(tree_cache, 'evictable_size') else 0
+        _avail_after = 0
+        try:
+            _avail_after = tree_cache.token_to_kv_pool_allocator.available_size()
+        except Exception:
+            pass
         logger.info(
             f"[SessionEnd] session={session_id} freed {total_freed} tokens "
-            f"({len(exclusive_nodes)} exclusive nodes cleaned)"
+            f"({len(exclusive_nodes)} exclusive nodes cleaned) "
+            f"evictable: {_evict_before} -> {_evict_after} (delta={_evict_after - _evict_before}), "
+            f"available: {_avail_before} -> {_avail_after}"
         )
+    else:
+        _evict_after = tree_cache.evictable_size() if hasattr(tree_cache, 'evictable_size') else 0
+        logger.info(
+            f"[SessionEnd] session={session_id} freed 0 tokens "
+            f"evictable: {_evict_before} -> {_evict_after} (delta={_evict_after - _evict_before})"
+        )
+
+    # SAFETY: Clamp evictable_size_ to 0 if negative.
+    # Across rounds, double-decrement can occur when session-end cleanup
+    # and regular eviction both process the same node's tokens.
+    # A negative evictable_size_ deflates rem_total_tokens = available + evictable,
+    # preventing the scheduler from admitting new prefills → simulation hang.
+    if hasattr(tree_cache, 'evictable_size_') and tree_cache.evictable_size_ < 0:
+        logger.warning(
+            f"[SessionEnd] evictable_size_ went negative ({tree_cache.evictable_size_}), "
+            f"clamping to 0"
+        )
+        tree_cache.evictable_size_ = 0
 
 
 class C_SchedulerHook(BaseHook):
@@ -2400,10 +2435,60 @@ class C_SchedulerHook(BaseHook):
                         f"(available={_avail}, max={_max}, "
                         f"total_free={_total_free} > max={_max})"
                     )
+                # FIX: If evictable_size_ is negative, clamp to 0.
+                # Negative evictable_size_ can occur due to double-decrement
+                # across rounds (session-end cleanup + regular eviction).
+                # This deflates rem_total_tokens = available + evictable,
+                # preventing prefills from being admitted.
+                if _evict < 0:
+                    logger.warning(
+                        f"[AdmissionFix] NEGATIVE evictable_size_={_evict}, "
+                        f"clamping to 0 (available={_avail}, max={_max})"
+                    )
+                    self.tree_cache.evictable_size_ = 0
+            except Exception:
+                pass
+
+            # DEBUG: Log admission state before calling original (only when abnormal)
+            try:
+                _avail_pre = self.token_to_kv_pool_allocator.available_size()
+                _evict_pre = self.tree_cache.evictable_size()
+                _max_pre = self.max_total_num_tokens
+                _rem_pre = _avail_pre + _evict_pre
+                _running = len(self.running_batch) if hasattr(self, 'running_batch') else -1
+                _queue = len(self.waiting_queue) if hasattr(self, 'waiting_queue') else -1
+                _batch_full = getattr(self.running_batch, 'batch_is_full', False) if hasattr(self, 'running_batch') else False
+                if _evict_pre < 0 or _rem_pre < 0 or _batch_full:
+                    logger.warning(
+                        f"[AdmissionDebug] available={_avail_pre} evictable={_evict_pre} "
+                        f"max={_max_pre} rem_total={_rem_pre} running={_running} queue={_queue} "
+                        f"batch_is_full={_batch_full}"
+                    )
             except Exception:
                 pass
 
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
+
+            # DEBUG: Log if prefill was rejected (only log first 20 rejections)
+            if new_batch is None:
+                try:
+                    if not hasattr(self, '_admission_reject_count'):
+                        self._admission_reject_count = 0
+                    self._admission_reject_count += 1
+                    if self._admission_reject_count <= 20:
+                        _avail_post = self.token_to_kv_pool_allocator.available_size()
+                        _evict_post = self.tree_cache.evictable_size()
+                        _max_post = self.max_total_num_tokens
+                        _rem_post = _avail_post + _evict_post
+                        _batch_full_post = getattr(self.running_batch, 'batch_is_full', False) if hasattr(self, 'running_batch') else False
+                        logger.warning(
+                            f"[AdmissionReject] available={_avail_post} evictable={_evict_post} "
+                            f"max={_max_post} rem_total={_rem_post} "
+                            f"batch_is_full={_batch_full_post} "
+                            f"(count={self._admission_reject_count})"
+                        )
+                except Exception:
+                    pass
             now = time.time()
 
             # Detailed debugging for large requests (>= 10000 tokens)
@@ -3450,6 +3535,19 @@ class C_PoolStatsObserverHook(BaseHook):
             available = pool_stats.full_available_size
             evictable = pool_stats.full_evictable_size
             total_free = available + evictable
+
+            # FIX: Clamp negative evictable_size to 0.
+            # Negative evictable_size can occur due to double-decrement across
+            # rounds (session-end cleanup + regular eviction). This deflates
+            # rem_total_tokens = available + evictable, preventing prefills.
+            if evictable < 0:
+                logger.warning(
+                    f"[PoolStatsFix] NEGATIVE evictable={evictable}, clamping to 0 "
+                    f"(available={available}, max_total={max_total})"
+                )
+                pool_stats.full_evictable_size = 0
+                evictable = 0
+                total_free = available + evictable
 
             if total_free > max_total:
                 # Scale down proportionally to preserve the ratio
