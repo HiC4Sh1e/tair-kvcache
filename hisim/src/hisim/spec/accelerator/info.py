@@ -22,3 +22,24 @@ class NVIDIA:
         },
         save_to_registry=True,
     )
+
+    NVIDIA_H20_A3 = AcceleratorInfo.from_dict(
+        config={
+            "name": "NVIDIA H20_A3",
+            "device_alias": ["H20_A3", "h20_a3"],
+            "tflops": {
+                "FP8_TENSOR": 296,
+                "INT8_TENSOR": 296,
+                "FP16_TENSOR": 148,
+                "BF16_TENSOR": 148,
+                "FP32": 74,
+            },
+            "hbm_capacity_gb": 96,
+            "hbm_bandwidth_gb": 1600,
+            "inter_node_bandwidth_gb": 64,
+            "intra_node_bandwidth_gb": 450,
+            "vendor": "NVIDIA",
+            "ref": "H20 with reduced HBM bandwidth (1600 GB/s)",
+        },
+        save_to_registry=True,
+    )
