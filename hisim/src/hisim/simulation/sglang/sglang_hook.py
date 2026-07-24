@@ -2414,40 +2414,17 @@ class C_SchedulerHook(BaseHook):
             return recv_reqs
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
-            # CRITICAL FIX: Clamp evictable_size_ before scheduler admission control.
-            # In simulation, available_size() + evictable_size_ can exceed
-            # max_total_num_tokens due to mock allocator accounting errors
-            # (duplicate frees, double-counted load_back/dec_lock_ref increments,
-            # session-end cleanup imprecision). This inflates PrefillAdder.rem_total_tokens,
-            # causing the scheduler to over-admit requests → huge decode batch_size
-            # → inflated TPOT. Fix by clamping so available + evictable <= max_total.
-            try:
-                _avail = self.token_to_kv_pool_allocator.available_size()
-                _evict = self.tree_cache.evictable_size()
-                _max = self.max_total_num_tokens
-                _total_free = _avail + _evict
-                if _total_free > _max and _max > 0:
-                    _old_evict = _evict
-                    self.tree_cache.evictable_size_ = max(0, _max - _avail)
-                    logger.debug(
-                        f"[AdmissionFix] Clamped evictable_size_: "
-                        f"{_old_evict} -> {self.tree_cache.evictable_size_} "
-                        f"(available={_avail}, max={_max}, "
-                        f"total_free={_total_free} > max={_max})"
-                    )
-                # FIX: If evictable_size_ is negative, clamp to 0.
-                # Negative evictable_size_ can occur due to double-decrement
-                # across rounds (session-end cleanup + regular eviction).
-                # This deflates rem_total_tokens = available + evictable,
-                # preventing prefills from being admitted.
-                if _evict < 0:
-                    logger.warning(
-                        f"[AdmissionFix] NEGATIVE evictable_size_={_evict}, "
-                        f"clamping to 0 (available={_avail}, max={_max})"
-                    )
-                    self.tree_cache.evictable_size_ = 0
-            except Exception:
-                pass
+            # NOTE: The previous admission-control clamp on evictable_size_ has
+            # been removed. It masked the underlying accounting imbalance
+            # (negative evictable_size_ from split/restore length mismatch,
+            # inflated available_size_ from duplicate free() calls) by forcing
+            # rem_total_tokens = max_total - offset, which made the scheduler
+            # over-admit prefills and led to decode batches whose token usage
+            # exceeded max_total_num_tokens. Now the scheduler sees the true
+            # (possibly negative or inflated) values: if rem_total_tokens <= 0
+            # prefills are rejected (visible stall) and if available + evictable
+            # > max the downstream invariant checker raises. Both surface the
+            # real bug instead of hiding it.
 
             # DEBUG: Log admission state before calling original (only when abnormal)
             try:
