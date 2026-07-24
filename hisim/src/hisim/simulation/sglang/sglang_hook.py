@@ -3251,7 +3251,15 @@ class C_RadixCacheFixHook(BaseHook):
         from sglang.srt.mem_cache.radix_cache import RadixKey, MatchPrefixParams, InsertParams
 
         def wrapped_cache_unfinished_req(self, req, chunked=False):
-            """Cache request when it is unfinished, with chunk length fix"""
+            """Cache request when it is unfinished, with chunk length fix.
+
+            IMPORTANT: This wrapper must call dec_lock_ref/inc_lock_ref after
+            insert, matching the original RadixCache.cache_unfinished_req.
+            Without these calls, newly inserted nodes keep lock_ref==0 and
+            remain in evictable_leaves, allowing the evictor to prematurely
+            evict KV cache of running requests that have finished prefill but
+            not yet started decode.
+            """
             if self.disable:
                 return
 
@@ -3297,7 +3305,15 @@ class C_RadixCacheFixHook(BaseHook):
                         f"len(radix_key)={len(radix_key)}. "
                         f"Skipping cache update to maintain consistency."
                     )
-                    # Skip the update to avoid memory state corruption
+                    # Even on length mismatch, we must update lock_ref so that
+                    # inserted nodes are not left with lock_ref==0 (which would
+                    # make them evictable while the request is still running).
+                    # new_last_node may be shorter than expected but is still a
+                    # valid tree node for locking the inserted prefix.
+                    self.dec_lock_ref(req.last_node)
+                    if new_last_node is not None:
+                        self.inc_lock_ref(new_last_node)
+                        req.last_node = new_last_node
                     return
 
                 self.req_to_token_pool.write(
@@ -3306,6 +3322,24 @@ class C_RadixCacheFixHook(BaseHook):
                 )
 
                 req.cache_protected_len = len(new_indices)
+
+                # Release the lock on the old last_node and acquire a lock on
+                # the new last_node. This is critical: without inc_lock_ref,
+                # the newly inserted nodes stay in evictable_leaves with
+                # lock_ref==0, allowing the evictor to evict KV cache of
+                # running requests that have finished prefill but not yet
+                # started decode.
+                self.dec_lock_ref(req.last_node)
+                self.inc_lock_ref(new_last_node)
+
+                # Update req.prefix_indices and req.last_node (matches original)
+                if len(new_indices) < len(kv_indices):
+                    req.prefix_indices = torch.cat(
+                        [new_indices, kv_indices[len(new_indices):]]
+                    )
+                else:
+                    req.prefix_indices = new_indices
+                req.last_node = new_last_node
 
                 # Session-aware: tag nodes along the prefix path with session_id
                 custom_params = getattr(req.sampling_params, 'custom_params', None) if hasattr(req, 'sampling_params') and req.sampling_params else None
