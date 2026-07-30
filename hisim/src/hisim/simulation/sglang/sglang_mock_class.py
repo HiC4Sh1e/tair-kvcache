@@ -561,11 +561,18 @@ class MockBaseTokenToKVPoolAllocator:
 
     def available_size(self):
         raw = (len(self.free_pages) + len(self.release_pages)) * self.page_size
-        # Cap to self.size to prevent over-counting caused by invalid free()
-        # calls (e.g., duplicate frees, out-of-range indices). Without this,
-        # the scheduler's admission control (rem_total_tokens) can be
-        # inflated, allowing more requests than HBM can hold.
-        return min(raw, self.size)
+        # No cap: if raw > self.size, it means free_pages was inflated by
+        # duplicate/invalid free() calls. The free() validation now raises
+        # RuntimeError on duplicates, so this should never happen in normal
+        # operation. If it does, surface it as a warning so the underlying
+        # accounting bug is visible rather than hidden.
+        if raw > self.size:
+            logger.warning(
+                f"[MemoryBug] available_size()={raw} > size={self.size}. "
+                f"free_pages inflated by duplicate frees. This will cause "
+                f"admission control over-admission."
+            )
+        return raw
 
     def get_kvcache(self):
         return self._kvcache
@@ -656,12 +663,28 @@ class MockTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
         return select_index
 
     def free(self, free_index: torch.Tensor):
-        # Note: We don't validate indices here because the simulation's
-        # radix tree may legitimately free the same index through different
-        # code paths (e.g., node eviction + request completion for shared
-        # prefix nodes). Over-validation causes OOM by shrinking free_pages.
-        # The available_size() cap is sufficient to prevent the scheduler
-        # from over-admitting requests.
+        if free_index.numel() == 0:
+            return
+        # Validate: detect duplicate frees and out-of-range indices.
+        # These indicate accounting bugs that must be fixed at the source,
+        # not papered over. Raising here surfaces the real bug.
+        new_indices = free_index.tolist()
+        for idx in new_indices:
+            if idx < 1 or idx > self.size:
+                raise RuntimeError(
+                    f"[MemoryBug] free() out-of-range index {idx} "
+                    f"(valid range [1, {self.size}]). This indicates an "
+                    f"accounting bug in the radix tree eviction path."
+                )
+        existing = set(self.free_pages.tolist())
+        duplicates = [idx for idx in new_indices if idx in existing]
+        if duplicates:
+            raise RuntimeError(
+                f"[MemoryBug] free() duplicate indices {duplicates[:10]}"
+                f"{'...' if len(duplicates) > 10 else ''} "
+                f"already in free_pages. This indicates a double-free bug "
+                f"in the radix tree eviction path."
+            )
         self.free_pages = torch.cat((self.free_pages, free_index))
 
 
@@ -705,6 +728,27 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            # Validate: detect duplicate frees and out-of-range page IDs.
+            # These indicate accounting bugs that must be fixed at the source,
+            # not papered over. Raising here surfaces the real bug.
+            new_pages = free_page_indices.tolist()
+            max_page = self.num_pages
+            for pg in new_pages:
+                if pg < 1 or pg > max_page:
+                    raise RuntimeError(
+                        f"[MemoryBug] free() out-of-range page {pg} "
+                        f"(valid range [1, {max_page}]). This indicates an "
+                        f"accounting bug in the radix tree eviction path."
+                    )
+            existing = set(self.free_pages.tolist())
+            duplicates = [pg for pg in new_pages if pg in existing]
+            if duplicates:
+                raise RuntimeError(
+                    f"[MemoryBug] free() duplicate page ids {duplicates[:10]}"
+                    f"{'...' if len(duplicates) > 10 else ''} "
+                    f"already in free_pages. This indicates a double-free "
+                    f"bug in the radix tree eviction path."
+                )
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
@@ -779,16 +823,11 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_cpu(
-            seq_lens_ptr=seq_lens,
-            last_loc_ptr=last_loc,
-            free_page_ptr=self.free_pages,
-            out_indices=out_indices,
-            bs_upper=None,  # Reserved parameter (not used in CPU)
-            page_size=self.page_size,
-        )
-
+        # Bounds check BEFORE alloc_decode_cpu (matches alloc_extend order).
+        # Without this, alloc_decode_cpu crashes with IndexError when
+        # free_pages doesn't have enough pages (it accesses free_pages[i]
+        # without bounds checking). Returning None here lets SGLang raise
+        # RuntimeError("Decode out of memory") with a clear message.
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
@@ -801,6 +840,16 @@ class MockPagedTokenToKVPoolAllocator(MockBaseTokenToKVPoolAllocator):
                 f"seq_lens={seq_lens_cpu.tolist()}"
             )
             return None
+
+        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        alloc_decode_cpu(
+            seq_lens_ptr=seq_lens,
+            last_loc_ptr=last_loc,
+            free_page_ptr=self.free_pages,
+            out_indices=out_indices,
+            bs_upper=None,  # Reserved parameter (not used in CPU)
+            page_size=self.page_size,
+        )
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices

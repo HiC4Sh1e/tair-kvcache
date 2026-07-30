@@ -28,7 +28,6 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
         sglang_hook.C_RadixCacheFixHook,
-        sglang_hook.C_InvariantCheckerHook,
         sglang_hook.C_PoolStatsObserverHook,
     ]
 )

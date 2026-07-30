@@ -2188,26 +2188,16 @@ class C_SchedulerHook(BaseHook):
                 )
                 raise e
 
-            # Fix: Override on_idle to disable invariant checking that causes false positives
-            # In HiSim simulation, memory accounting is CPU-based approximation, not accurate GPU accounting
-            # This leads to false positive "pool memory leak" errors during idle checks
+            # Override on_idle: previously this wrapper swallowed
+            # "pool memory leak" / "invariant" ValueErrors to keep simulation
+            # running. That hid real accounting bugs. Now we let the original
+            # on_idle run unmodified — if the invariant checker detects a
+            # leak, the ValueError propagates and surfaces the real bug.
             if hasattr(self, 'on_idle') and hasattr(self, 'invariant_checker'):
                 original_on_idle = self.on_idle
 
                 def wrapped_on_idle(*args, **kwargs):
-                    # Skip invariant checks during idle in simulation mode
-                    # The invariant checker's memory leak detection is not accurate for HiSim
-                    try:
-                        return original_on_idle(*args, **kwargs)
-                    except ValueError as e:
-                        if "pool memory leak" in str(e) or "invariant" in str(e):
-                            logger.debug(
-                                f"Ignoring on_idle invariant check error in simulation mode: {e}"
-                            )
-                            # Don't raise the error - allow simulation to continue
-                            return None
-                        else:
-                            raise
+                    return original_on_idle(*args, **kwargs)
 
                 self.on_idle = wrapped_on_idle
 
@@ -2799,20 +2789,7 @@ class C_SchedulerHook(BaseHook):
             # Removed debug logs for batch processing state
             running_batch_size_before = len(self.running_batch.reqs)
 
-            try:
-                ret = original_process_batch_result(self, *args, **kwargs)
-            except ValueError as e:
-                # Handle memory leak detection errors in simulation mode
-                if "pool memory leak" in str(e) or "invariant" in str(e):
-                    logger.info(
-                        f"Ignoring invariant check error in simulation mode: {e} "
-                        f"(Memory accounting may be imprecise in HiSim simulation)"
-                    )
-                    # Return a dummy result to continue simulation
-                    return None
-                else:
-                    # Re-raise other ValueErrors
-                    raise
+            ret = original_process_batch_result(self, *args, **kwargs)
 
             # IMPORTANT FIX: Handle None return value for chunked prefill
             # When process_batch_result returns None, SGLang may have internally processed
@@ -3263,102 +3240,92 @@ class C_RadixCacheFixHook(BaseHook):
             if self.disable:
                 return
 
-            try:
-                token_ids = req.get_fill_ids()
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : len(token_ids)
-                ]
+            token_ids = req.get_fill_ids()
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
 
-                radix_key = RadixKey(
-                    token_ids, req.extra_key, is_bigram=self.is_eagle
-                ).page_aligned(self.page_size)
-                values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
+            radix_key = RadixKey(
+                token_ids, req.extra_key, is_bigram=self.is_eagle
+            ).page_aligned(self.page_size)
+            values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
-                # Radix Cache takes one ref in memory pool
-                result = self.insert(
-                    InsertParams(
-                        key=radix_key,
-                        value=values,
-                        chunked=chunked,
-                        priority=getattr(req, "priority", 0) or 0,
-                    )
+            # Radix Cache takes one ref in memory pool
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    chunked=chunked,
+                    priority=getattr(req, "priority", 0) or 0,
                 )
-                new_prefix_len = result.prefix_len
+            )
+            new_prefix_len = result.prefix_len
 
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[req.cache_protected_len : new_prefix_len]
-                )
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : new_prefix_len]
+            )
 
-                # The prefix indices could be updated, reuse it
-                match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-                new_indices, new_last_node = (
-                    match_result.device_indices,
-                    match_result.last_device_node,
-                )
+            # The prefix indices could be updated, reuse it
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            new_indices, new_last_node = (
+                match_result.device_indices,
+                match_result.last_device_node,
+            )
 
-                # Fix: Handle length mismatch that can occur during chunked operations
-                # This can happen when the cache tree doesn't fully contain all expected prefixes
-                # or request state during chunked operations gets out of sync
-                if len(new_indices) != len(radix_key):
-                    logger.debug(
-                        f"Cache length mismatch: len(new_indices)={len(new_indices)}, "
-                        f"len(radix_key)={len(radix_key)}. "
-                        f"Skipping cache update to maintain consistency."
-                    )
-                    # Even on length mismatch, we must update lock_ref so that
-                    # inserted nodes are not left with lock_ref==0 (which would
-                    # make them evictable while the request is still running).
-                    # new_last_node may be shorter than expected but is still a
-                    # valid tree node for locking the inserted prefix.
-                    self.dec_lock_ref(req.last_node)
-                    if new_last_node is not None:
-                        self.inc_lock_ref(new_last_node)
-                        req.last_node = new_last_node
-                    return
-
-                self.req_to_token_pool.write(
-                    (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-                    new_indices[req.cache_protected_len :],
-                )
-
-                req.cache_protected_len = len(new_indices)
-
-                # Release the lock on the old last_node and acquire a lock on
-                # the new last_node. This is critical: without inc_lock_ref,
-                # the newly inserted nodes stay in evictable_leaves with
-                # lock_ref==0, allowing the evictor to evict KV cache of
-                # running requests that have finished prefill but not yet
-                # started decode.
-                self.dec_lock_ref(req.last_node)
-                self.inc_lock_ref(new_last_node)
-
-                # Update req.prefix_indices and req.last_node (matches original)
-                if len(new_indices) < len(kv_indices):
-                    req.prefix_indices = torch.cat(
-                        [new_indices, kv_indices[len(new_indices):]]
-                    )
-                else:
-                    req.prefix_indices = new_indices
-                req.last_node = new_last_node
-
-                # Session-aware: tag nodes along the prefix path with session_id
-                custom_params = getattr(req.sampling_params, 'custom_params', None) if hasattr(req, 'sampling_params') and req.sampling_params else None
-                sim_args = custom_params.get("simulation", {}) if custom_params else {}
-                session_id = sim_args.get("session_id")
-                if session_id is not None:
-                    tag_node = new_last_node
-                    while tag_node is not None and tag_node is not self.root_node:
-                        _tag_node_with_session(tag_node, session_id)
-                        tag_node = tag_node.parent
-
-            except (AttributeError, ValueError, RuntimeError) as e:
-                # Handle errors gracefully in simulation mode
-                # This prevents simulation crashes due to simulation-specific issues
+            # Fix: Handle length mismatch that can occur during chunked operations
+            # This can happen when the cache tree doesn't fully contain all expected prefixes
+            # or request state during chunked operations gets out of sync
+            if len(new_indices) != len(radix_key):
                 logger.debug(
-                    f"Cache update skipped due to error in simulation mode: {e}"
+                    f"Cache length mismatch: len(new_indices)={len(new_indices)}, "
+                    f"len(radix_key)={len(radix_key)}. "
+                    f"Skipping cache update to maintain consistency."
                 )
-                # Don't raise the error, continue with simulation
-                pass
+                # Even on length mismatch, we must update lock_ref so that
+                # inserted nodes are not left with lock_ref==0 (which would
+                # make them evictable while the request is still running).
+                # new_last_node may be shorter than expected but is still a
+                # valid tree node for locking the inserted prefix.
+                self.dec_lock_ref(req.last_node)
+                if new_last_node is not None:
+                    self.inc_lock_ref(new_last_node)
+                    req.last_node = new_last_node
+                return
+
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+                new_indices[req.cache_protected_len :],
+            )
+
+            req.cache_protected_len = len(new_indices)
+
+            # Release the lock on the old last_node and acquire a lock on
+            # the new last_node. This is critical: without inc_lock_ref,
+            # the newly inserted nodes stay in evictable_leaves with
+            # lock_ref==0, allowing the evictor to evict KV cache of
+            # running requests that have finished prefill but not yet
+            # started decode.
+            self.dec_lock_ref(req.last_node)
+            self.inc_lock_ref(new_last_node)
+
+            # Update req.prefix_indices and req.last_node (matches original)
+            if len(new_indices) < len(kv_indices):
+                req.prefix_indices = torch.cat(
+                    [new_indices, kv_indices[len(new_indices):]]
+                )
+            else:
+                req.prefix_indices = new_indices
+            req.last_node = new_last_node
+
+            # Session-aware: tag nodes along the prefix path with session_id
+            custom_params = getattr(req.sampling_params, 'custom_params', None) if hasattr(req, 'sampling_params') and req.sampling_params else None
+            sim_args = custom_params.get("simulation", {}) if custom_params else {}
+            session_id = sim_args.get("session_id")
+            if session_id is not None:
+                tag_node = new_last_node
+                while tag_node is not None and tag_node is not self.root_node:
+                    _tag_node_with_session(tag_node, session_id)
+                    tag_node = tag_node.parent
 
         # Apply the wrapper only if original method exists
         if hasattr(target, 'cache_unfinished_req'):
@@ -3444,66 +3411,6 @@ class C_RadixCacheFixHook(BaseHook):
 
         if hasattr(target, 'cache_finished_req'):
             target.cache_finished_req = wrapped_cache_finished_req
-
-        return target
-
-
-class C_InvariantCheckerHook(BaseHook):
-    """Hook to disable/modify invariant checking in simulation mode"""
-    HOOK_CLASS_NAME = "SchedulerInvariantChecker"
-    HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.invariant_checker"
-
-    @classmethod
-    def hook(cls, target):
-        original_check_full_pool = target._check_full_pool
-        original_report_leak = target._report_leak
-
-        def wrapped_check_full_pool(self, ps, uncached=0):
-            """Skip invariant checks in simulation mode to avoid false positives"""
-            # In simulation mode, memory accounting may be imprecise
-            # due to mock implementations and approximation logic
-            try:
-                is_leak, message = original_check_full_pool(self, ps, uncached)
-                if is_leak:
-                    # In simulation mode, ignore pool memory leak detection
-                    # The memory calculation in HiSim is CPU-based approximation,
-                    # not accurate GPU accounting, leading to false positives
-                    logger.debug(
-                        f"Ignoring pool memory leak detection in simulation mode: {message}"
-                    )
-                return False, ""  # Always return no leak in simulation mode
-            except ValueError as e:
-                if "pool memory leak" in str(e) or "invariant" in str(e):
-                    logger.debug(
-                        f"Ignoring invariant check error in simulation mode: {e}"
-                    )
-                    # Return no leak to continue simulation
-                    return False, ""
-                else:
-                    raise
-            except Exception as e:
-                # Catch-all for any other exceptions in simulation mode
-                logger.debug(
-                    f"Ignoring pool memory leak check exception in simulation mode: {e}"
-                )
-                return False, ""
-
-        def wrapped_report_leak(self, pool_name, messages):
-            """Skip reporting leaks in simulation mode"""
-            if "pool memory leak" in "\n".join(messages):
-                # In HiSim simulation, memory leak detection often produces false positives
-                # due to CPU-based memory approximation vs actual GPU memory usage
-                logger.debug(
-                    f"Ignoring pool memory leak report in simulation mode for {pool_name}: "
-                    f"{' '.join(messages[:3])}"  # Log first 3 lines for debugging
-                )
-                # Don't raise the error - allow simulation to continue
-                return
-            else:
-                original_report_leak(self, pool_name, messages)
-
-        target._check_full_pool = wrapped_check_full_pool
-        target._report_leak = wrapped_report_leak
 
         return target
 
