@@ -1873,6 +1873,132 @@ def sample_hisim_collection_requests(
     return input_requests
 
 
+def expand_repeat_sessions(
+    input_requests: List[DatasetRow],
+    num_repeat_prompts: int,
+    seed: int,
+) -> List[DatasetRow]:
+    """Append a randomly-selected subset of sessions after the main requests.
+
+    Selects entire sessions from ``input_requests`` (grouped by session_id)
+    until the cumulative request count reaches ``num_repeat_prompts``. The
+    last selected session is truncated so the appended count is exact.
+
+    The first occurrence of selected sessions has ``session_end`` cancelled
+    (set to False) so KV cleanup does not trigger mid-workload. The appended
+    second occurrence keeps the original ``session_end`` flags, so cleanup
+    only triggers after the second run.
+
+    If the dataset has no ``session_id``, copies the first
+    ``num_repeat_prompts`` requests (looping if needed) without any
+    session_end manipulation.
+
+    Reproducibility: uses ``random.Random(seed)`` so the same seed always
+    selects the same sessions.
+    """
+    if num_repeat_prompts <= 0 or not input_requests:
+        return input_requests
+
+    # Detect session_id and session_end in the dataset
+    has_session_id = any(
+        req.simulation and req.simulation.get("session_id") is not None
+        for req in input_requests
+    )
+    has_session_end = any(
+        req.simulation and req.simulation.get("session_end")
+        for req in input_requests
+    )
+
+    # Timestamp offset for appended requests (replay after first batch)
+    timestamps = [r.timestamp for r in input_requests if r.timestamp is not None]
+    ts_offset = (max(timestamps) - min(timestamps) + 1.0) if timestamps else 0.0
+
+    def copy_req(req: DatasetRow) -> DatasetRow:
+        return DatasetRow(
+            prompt=req.prompt,
+            prompt_len=req.prompt_len,
+            output_len=req.output_len,
+            text_prompt_len=req.text_prompt_len,
+            vision_prompt_len=req.vision_prompt_len,
+            image_data=req.image_data,
+            timestamp=(req.timestamp + ts_offset) if req.timestamp is not None else None,
+            simulation=dict(req.simulation) if req.simulation else {},
+        )
+
+    if not has_session_id:
+        # No session_id: plain copy first num_repeat_prompts requests (loop if needed)
+        appended = []
+        total = len(input_requests)
+        full_passes = num_repeat_prompts // total
+        remainder = num_repeat_prompts % total
+        for _ in range(full_passes):
+            for req in input_requests:
+                appended.append(copy_req(req))
+        for req in input_requests[:remainder]:
+            appended.append(copy_req(req))
+        print(
+            f"num_repeat_prompts={num_repeat_prompts}: no session_id, "
+            f"appended {len(appended)} copied requests "
+            f"(total now {len(input_requests) + len(appended)})"
+        )
+        return input_requests + appended
+
+    # Session-aware: group by session_id (preserving first-appearance order)
+    session_groups: dict[str, list[int]] = defaultdict(list)
+    session_order = []
+    for idx, req in enumerate(input_requests):
+        sid = req.simulation.get("session_id")
+        if sid is None:
+            sid = f"__no_session_{idx}"
+        if sid not in session_groups:
+            session_order.append(sid)
+        session_groups[sid].append(idx)
+
+    # Deterministic shuffle for reproducibility
+    rng = random.Random(seed)
+    shuffled_order = session_order[:]
+    rng.shuffle(shuffled_order)
+
+    # Select sessions until cumulative count >= num_repeat_prompts
+    selected_req_indices: list[int] = []
+    for sid in shuffled_order:
+        if len(selected_req_indices) >= num_repeat_prompts:
+            break
+        selected_req_indices.extend(session_groups[sid])
+
+    # Truncate to exact count
+    selected_req_indices = selected_req_indices[:num_repeat_prompts]
+
+    # Build the set of actually-selected session ids (after truncation, the
+    # last session may be partial; only sessions that contribute at least one
+    # appended request get their first-occurrence session_end cancelled)
+    selected_sid_set = set()
+    for idx in selected_req_indices:
+        sid = input_requests[idx].simulation.get("session_id")
+        if sid is None:
+            sid = f"__no_session_{idx}"
+        selected_sid_set.add(sid)
+
+    # Build appended requests (second occurrence) BEFORE cancelling session_end
+    # so the copies retain the original session_end values.
+    appended = [copy_req(input_requests[idx]) for idx in selected_req_indices]
+
+    # Cancel session_end in the first occurrence of selected sessions
+    if has_session_end:
+        for req in input_requests:
+            if req.simulation and req.simulation.get("session_id") in selected_sid_set:
+                if req.simulation.get("session_end"):
+                    req.simulation["session_end"] = False
+
+    num_selected_sessions = len(selected_sid_set)
+    print(
+        f"num_repeat_prompts={num_repeat_prompts}: selected {num_selected_sessions} "
+        f"sessions ({len(selected_req_indices)} requests), appended after first "
+        f"batch (total now {len(input_requests) + len(appended)})"
+    )
+    return input_requests + appended
+
+
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
@@ -3016,13 +3142,28 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
-    # Expand request list by --num-rounds: repeat the selected request set
-    # n times with timestamp offsets per round so that round 2 starts after
-    # round 1 finishes when using trace timestamps.
-    # Note: Mooncake dataset uses dict format, not DatasetRow, and has its own
-    # --mooncake-num-rounds for multi-turn conversations. Skip here.
+    # --num-repeat-prompts: append a randomly-selected subset of sessions
+    # after the main batch. Mutually exclusive with --num-rounds>1.
+    num_repeat_prompts = getattr(args, "num_repeat_prompts", 0)
     num_rounds = getattr(args, "num_rounds", 1)
-    if num_rounds > 1 and input_requests and args.dataset_name != "mooncake":
+    if num_repeat_prompts > 0 and num_rounds > 1:
+        raise ValueError(
+            "--num-repeat-prompts and --num-rounds>1 are mutually exclusive. "
+            "Use one or the other."
+        )
+
+    if num_repeat_prompts > 0 and input_requests and args.dataset_name != "mooncake":
+        input_requests = expand_repeat_sessions(
+            input_requests,
+            num_repeat_prompts=num_repeat_prompts,
+            seed=args.seed,
+        )
+    elif num_rounds > 1 and input_requests and args.dataset_name != "mooncake":
+        # Expand request list by --num-rounds: repeat the selected request set
+        # n times with timestamp offsets per round so that round 2 starts after
+        # round 1 finishes when using trace timestamps.
+        # Note: Mooncake dataset uses dict format, not DatasetRow, and has its own
+        # --mooncake-num-rounds for multi-turn conversations. Skip here.
         # Calculate the time span of one round for timestamp offset
         timestamps = [r.timestamp for r in input_requests if r.timestamp is not None]
         round_duration = (max(timestamps) - min(timestamps)) if timestamps else 0
@@ -3185,6 +3326,18 @@ if __name__ == "__main__":
         help="Number of rounds to repeat the selected request set. "
         "Requests are first sampled via --num-prompts, then sent this many times. "
         "Total sent = num_prompts * num_rounds. Default is 1.",
+    )
+    parser.add_argument(
+        "--num-repeat-prompts",
+        type=int,
+        default=0,
+        help="Append a randomly-selected subset of sessions (from the first "
+        "num_prompts requests) after the main batch. The first occurrence of "
+        "selected sessions has session_end cancelled; the appended second "
+        "occurrence keeps session_end so KV cleanup triggers after the second "
+        "run. Exact count: the last selected session is truncated to match. "
+        "Mutually exclusive with --num-rounds>1. Total sent = num_prompts + "
+        "num_repeat_prompts. Default is 0 (disabled).",
     )
     parser.add_argument(
         "--sharegpt-output-len",
