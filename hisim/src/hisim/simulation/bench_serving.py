@@ -1999,6 +1999,55 @@ def expand_repeat_sessions(
     return input_requests + appended
 
 
+def mark_session_interrupts(
+    input_requests: List[DatasetRow],
+    freq: float,
+    seed: int,
+) -> List[DatasetRow]:
+    """Randomly mark requests in some sessions as interrupt points.
+
+    For each session with more than 1 request, with probability ``freq``,
+    marks one request (not the last) with ``simulation["interrupt_marker"] = True``.
+    When a concurrent worker hits this marker, it steals
+    ``--session-interrupt-count`` requests from another session in the queue,
+    then resumes the original session.
+
+    Uses ``random.Random(seed)`` for reproducibility.
+    """
+    if freq <= 0 or not input_requests:
+        return input_requests
+
+    # Group by session_id (preserving first-appearance order)
+    session_groups: dict[str, list[int]] = defaultdict(list)
+    for idx, req in enumerate(input_requests):
+        sid = req.simulation.get("session_id") if req.simulation else None
+        if sid is None:
+            sid = f"__no_session_{idx}"
+        session_groups[sid].append(idx)
+
+    rng = random.Random(seed)
+    marked_count = 0
+    for sid, indices in session_groups.items():
+        if len(indices) <= 1:
+            continue  # Can't interrupt a 1-request session
+        if rng.random() >= freq:
+            continue
+        # Pick a random position, excluding the last request
+        # (so the worker has something to resume after the interrupt)
+        marker_pos = rng.randint(0, len(indices) - 2)
+        marker_idx = indices[marker_pos]
+        if input_requests[marker_idx].simulation is None:
+            input_requests[marker_idx].simulation = {}
+        input_requests[marker_idx].simulation["interrupt_marker"] = True
+        marked_count += 1
+
+    print(
+        f"session_interrupt: marked {marked_count}/{len(session_groups)} sessions "
+        f"(freq={freq:.2f}, seed={seed})"
+    )
+    return input_requests
+
+
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
@@ -2575,41 +2624,95 @@ async def benchmark(
         # Collect outputs indexed by original position
         output_dict: dict[int, RequestFuncOutput] = {}
 
+        # Track how many requests have been stolen from each session by
+        # interrupt markers. Shared across workers. Keyed by session_id.
+        # When a worker normally processes a session, it starts from
+        # stolen_counter[sid] (skipping already-stolen requests).
+        stolen_counter: dict[str, int] = {}
+        interrupt_count = getattr(args, "session_interrupt_count", 0)
+
+        async def send_one_request(idx: int, req: DatasetRow):
+            """Send a single request and store the output. Shared by the
+            normal worker loop and the steal path to keep LoRA/sending
+            logic in one place."""
+            # Handle LoRA
+            if lora_names is not None and len(lora_names) != 0:
+                if lora_request_distribution == "uniform":
+                    _lora_name = random.choice(lora_names)
+                elif lora_request_distribution == "distinct":
+                    _lora_name = lora_names[0]  # simplified for session mode
+                else:
+                    _lora_name = np.random.choice(lora_names, p=lora_probs) if lora_probs is not None else None
+            else:
+                _lora_name = None
+
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=req.prompt,
+                api_url=api_url,
+                prompt_len=req.prompt_len,
+                output_len=req.output_len,
+                lora_name=_lora_name,
+                image_data=req.image_data,
+                extra_request_body=extra_request_body,
+                timestamp=req.timestamp,
+                simulation=req.simulation,
+            )
+            output = await request_func(
+                request_func_input=request_func_input, pbar=pbar
+            )
+            output_dict[idx] = output
+
+        async def steal_and_send_requests():
+            """Steal up to interrupt_count requests from another session in
+            the queue, then put the victim session back if it has remaining
+            requests.
+
+            Concurrency safety: ``get_nowait`` removes the victim from the
+            queue, so no other worker can access it during the steal. The
+            ``stolen_counter`` update and ``put_nowait`` happen after all
+            stolen requests are sent, so the victim is exclusively owned
+            for the duration of the steal.
+            """
+            if interrupt_count <= 0:
+                return
+            # Find a victim session with remaining (un-stolen) requests
+            while True:
+                try:
+                    victim_sid = session_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return  # No sessions to steal from
+                start = stolen_counter.get(victim_sid, 0)
+                if start < len(sessions[victim_sid]):
+                    break
+                # Session fully stolen already; try next
+            # Send up to interrupt_count requests from victim_sid
+            remaining = sessions[victim_sid][start:]
+            to_send = remaining[:interrupt_count]
+            for v_idx, v_req in to_send:
+                await send_one_request(v_idx, v_req)
+            stolen_counter[victim_sid] = start + len(to_send)
+            # Put victim back if there are remaining requests
+            if stolen_counter[victim_sid] < len(sessions[victim_sid]):
+                session_queue.put_nowait(victim_sid)
+
         async def session_worker():
             while True:
                 try:
                     sid = session_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                for idx, req in sessions[sid]:
-                    # Handle LoRA
-                    if lora_names is not None and len(lora_names) != 0:
-                        if lora_request_distribution == "uniform":
-                            _lora_name = random.choice(lora_names)
-                        elif lora_request_distribution == "distinct":
-                            _lora_name = lora_names[0]  # simplified for session mode
-                        else:
-                            _lora_name = np.random.choice(lora_names, p=lora_probs) if lora_probs is not None else None
-                    else:
-                        _lora_name = None
-
-                    request_func_input = RequestFuncInput(
-                        model=model_id,
-                        prompt=req.prompt,
-                        api_url=api_url,
-                        prompt_len=req.prompt_len,
-                        output_len=req.output_len,
-                        lora_name=_lora_name,
-                        image_data=req.image_data,
-                        extra_request_body=extra_request_body,
-                        timestamp=req.timestamp,
-                        simulation=req.simulation,
-                    )
+                # Skip requests already stolen by interrupt markers from
+                # other workers
+                start_idx = stolen_counter.get(sid, 0)
+                for idx, req in sessions[sid][start_idx:]:
                     # Strictly serial within session: await completion before next request
-                    output = await request_func(
-                        request_func_input=request_func_input, pbar=pbar
-                    )
-                    output_dict[idx] = output
+                    await send_one_request(idx, req)
+                    # Check for interrupt marker: after completing this
+                    # request, steal n requests from another session, then
+                    # resume the current session.
+                    if req.simulation and req.simulation.get("interrupt_marker") and interrupt_count > 0:
+                        await steal_and_send_requests()
 
         workers = [asyncio.create_task(session_worker()) for _ in range(max_concurrency)]
         await asyncio.gather(*workers)
@@ -3192,6 +3295,17 @@ def run_benchmark(args_: argparse.Namespace):
             f"{len(input_requests)} requests (round_duration={round_duration:.2f}s)"
         )
 
+    # --session-interrupt-freq: randomly mark requests in some sessions as
+    # interrupt points. Only effective with --session-interrupt-count > 0.
+    interrupt_count = getattr(args, "session_interrupt_count", 0)
+    interrupt_freq = getattr(args, "session_interrupt_freq", 0.0)
+    if interrupt_count > 0 and interrupt_freq > 0 and input_requests:
+        input_requests = mark_session_interrupts(
+            input_requests,
+            freq=interrupt_freq,
+            seed=args.seed,
+        )
+
     # Prepare LoRA arguments
     lora_request_distribution = (
         args.lora_request_distribution if args.lora_name is not None else None
@@ -3338,6 +3452,26 @@ if __name__ == "__main__":
         "run. Exact count: the last selected session is truncated to match. "
         "Mutually exclusive with --num-rounds>1. Total sent = num_prompts + "
         "num_repeat_prompts. Default is 0 (disabled).",
+    )
+    parser.add_argument(
+        "--session-interrupt-count",
+        type=int,
+        default=0,
+        help="When a session worker hits an interrupt marker, steal this many "
+        "requests from another session in the queue, then resume the original "
+        "session. Creates interleaving where new sessions occupy HBM space of "
+        "ended sessions while running sessions are preserved. Only effective "
+        "with --max-concurrency and session-aware datasets. "
+        "Default is 0 (disabled).",
+    )
+    parser.add_argument(
+        "--session-interrupt-freq",
+        type=float,
+        default=0.0,
+        help="Fraction of sessions (0.0-1.0) that get an interrupt marker. "
+        "Each marked session has one request (not the last) randomly chosen as "
+        "the interrupt point. Only effective with --session-interrupt-count > 0. "
+        "Default is 0.0 (disabled).",
     )
     parser.add_argument(
         "--sharegpt-output-len",
