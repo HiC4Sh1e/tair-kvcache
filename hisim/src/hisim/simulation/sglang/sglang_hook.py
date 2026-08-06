@@ -218,6 +218,25 @@ class C_ModelRunnerHook(BaseHook):
         _version_dispatcher = VersionDispatcher()
 
         def override_initialize(self, *args, **kwargs):
+            # Force CPU device for simulation — HiSim is CPU-based.
+            # On GPU machines, server_args.device auto-detects to "cuda", causing
+            # all mock pools (MockReqToTokenPool, MockTokenToKVPool, allocator)
+            # to allocate on GPU → CUDA OOM at kv_indices.to(copy=True).
+            # Forcing CPU here holistically ensures batch.device, prefix_lens
+            # tensors, wrapped_sample allocations, and mock pools all stay on CPU.
+            self.device = "cpu"
+            self.server_args.device = "cpu"
+            # x86 CPU defaults attention_backend to "intel_amx", which makes
+            # get_last_loc (common.py:119) take the triton dispatch path
+            # (uses_triton_dispatch = backend not in ("ascend","torch_native")).
+            # Force "torch_native" so both write_cache_indices and get_last_loc
+            # use pure-PyTorch non-triton paths — CPU compatible.
+            self.server_args.attention_backend = "torch_native"
+            logger.info(
+                f"Forced CPU simulation mode: device={self.device}, "
+                f"attention_backend={self.server_args.attention_backend}"
+            )
+
             # First ensure model and hardware are registered in this subprocess
             # Because multiprocessing creates new processes without shared memory
             config_path = os.getenv("HISIM_CONFIG_PATH")
