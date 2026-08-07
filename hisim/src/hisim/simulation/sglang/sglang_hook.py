@@ -480,6 +480,17 @@ class C_ModelRunnerHook(BaseHook):
             self.graph_mem_usage = 0
             self.weight_load_mem_usage = 10
 
+            # Override forward_stream with a CPU stream.
+            # ModelRunner.__init__ (model_runner.py:548) creates forward_stream
+            # using torch.get_device_module(self.device) — but at __init__ time
+            # self.device is still "cuda" (auto-detected, before override_initialize
+            # forces it to "cpu"). The resulting CUDA stream is later used by
+            # Scheduler.init_overlap (scheduler.py:1193) inside
+            # `with self.forward_stream_ctx:` on every run_batch call. Mixing a
+            # CUDA stream with a CPU device_module (forced by override_initialize)
+            # causes "illegal memory access". Replace it with a CPU stream.
+            self.forward_stream = torch.get_device_module("cpu").Stream()
+
             self.max_running_requests = min(
                 (
                     self.max_total_num_tokens // 2
@@ -567,6 +578,26 @@ class C_ModelRunnerHook(BaseHook):
 
         def wrapped_compute_logprobs_only(*args, **kwargs):
             return None
+
+        # Patch module-level is_cuda()/is_hip() branch selections that run on
+        # the forward-prep path (before wrapped_forward can bypass real CUDA).
+        # SGLang picks CUDA implementations at import time based on
+        # torch.cuda.is_available(), NOT server_args.device. On a GPU machine
+        # running CPU simulation, these pick CUDA kernels and crash with
+        # "illegal memory access" when fed CPU tensors.
+        try:
+            from sglang.srt.model_executor import forward_batch_info as _fbi
+            # clamp_position: used by ForwardBatch.init_new for decode positions.
+            # Module-level `if is_cuda() or is_hip(): clamp_position = clamp_position_cuda`
+            # at fbi:1453. CUDA jit_kernel crashes on CPU seq_lens tensor.
+            if hasattr(_fbi, "_clamp_position_native") and hasattr(_fbi, "clamp_position"):
+                _fbi.clamp_position = _fbi._clamp_position_native
+                logger.info(
+                    "Patched forward_batch_info.clamp_position -> _clamp_position_native "
+                    "for CPU simulation"
+                )
+        except Exception as _e:
+            logger.warning(f"Failed to patch forward_batch_info.clamp_position: {_e}")
 
         target.initialize = override_initialize
         target.forward = _version_dispatcher.get_compat_method("forward")
