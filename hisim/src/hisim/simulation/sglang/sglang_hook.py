@@ -769,11 +769,119 @@ class C_HiCacheController(BaseHook):
             ]
             return self.storage_backend.batch_set(hash_values, data, extra_info)
 
+        def sim_start_writing(self) -> None:
+            """Simulation-safe version of start_writing.
+
+            The original start_writing creates CUDA events and records them on
+            a CUDA stream (cache_controller.py:732-748). On a machine with
+            GPUs but no active CUDA context in the sim process,
+            `start_event.record()` raises `torch.AcceleratorError: CUDA error:
+            an illegal memory access was encountered`.
+
+            In simulation, `sim_writing_check` (on HiRadixCache) drains
+            `ack_write_queue` and calls `_finish_write_through_ack` without
+            touching CUDA events — the event fields of HiCacheAck are ignored.
+            So we skip CUDA event/stream entirely and append a HiCacheAck with
+            None events.
+
+            The mock `backup_from_device_all_layer` (sglang_mock_class.py) is
+            numpy-only (computes timing, no real DMA), so it is safe to call.
+            `move_indices` with io_backend="direct" only does `.cpu()` and
+            `.sort()` on CPU tensors — also safe.
+            """
+            from sglang.srt.managers.cache_controller import CacheOperation, HiCacheAck
+
+            if len(self.write_queue) == 0:
+                return
+
+            op = CacheOperation.merge_ops(self.write_queue)
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
+            self.write_queue.clear()
+
+            # Mock host pool: numpy-only timing computation, no real DMA.
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device, host_indices, device_indices, self.io_backend
+            )
+            if self.has_draft:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
+
+            # Append ack with None events — sim_writing_check ignores events.
+            self.ack_write_queue.append(
+                HiCacheAck(start_event=None, finish_event=None, node_ids=op.node_ids)
+            )
+
+        def sim_start_loading(self) -> int:
+            """Simulation-safe version of start_loading.
+
+            The original start_loading uses layer_done_counter (CUDA events)
+            and a CUDA stream (cache_controller.py:802-844). Same CUDA error
+            risk as start_writing.
+
+            In simulation, `sim_loading_check` drains `ack_load_queue` and
+            calls `dec_lock_ref` without touching CUDA events. `sim_is_load_back_event_done`
+            always returns True. So we skip CUDA event/stream/layer_done_counter
+            entirely and append a HiCacheAck with None events.
+
+            The mock `load_to_device_per_layer` is numpy-only (timing only),
+            so calling it per-layer is safe.
+            """
+            from sglang.srt.managers.cache_controller import CacheOperation, HiCacheAck
+
+            if len(self.load_queue) == 0:
+                return -1
+
+            # Skip layer_done_counter.update_producer() — it queries CUDA events.
+            op = CacheOperation.merge_ops(self.load_queue)
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
+            self.load_queue.clear()
+
+            # Mock host pool: numpy-only timing computation per layer.
+            for i in range(self.layer_num):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    i,
+                    self.io_backend,
+                )
+                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+
+            # Append ack with None events — sim_loading_check ignores events.
+            self.ack_load_queue.append(
+                HiCacheAck(start_event=None, finish_event=None, node_ids=op.node_ids)
+            )
+            # Return a dummy producer_id; sim_is_load_back_event_done ignores it.
+            return 0
+
         target.prefetch_thread_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
         target._generic_page_set = override_generic_page_set
+        # Override CUDA-event/stream-dependent methods with simulation-safe versions.
+        # Original start_writing/start_loading crash on machines with GPUs but no
+        # active CUDA context in the sim process (illegal memory access at
+        # start_event.record()). The sim_writing_check/sim_loading_check on
+        # HiRadixCache drain the ack queues without touching CUDA events, so
+        # None events are safe.
+        target.start_writing = sim_start_writing
+        target.start_loading = sim_start_loading
         return target
 
 
